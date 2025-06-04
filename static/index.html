@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Voice Bot UI</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    #controls {
+      margin-bottom: 20px;
+    }
+    #transcripts {
+      width: 100%;
+      height: 300px;
+      border: 1px solid #ccc;
+      padding: 10px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      background: #f9f9f9;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      border-radius: 5px;
+      border: none;
+      background-color: #007bff;
+      color: white;
+      cursor: pointer;
+    }
+    button:disabled {
+      background-color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="startStopBtn">Start</button>
+  </div>
+  <div id="transcripts" readonly></div>
+
+<!-- <script>
+  let audioContext = null;
+  let playbackRate = null;
+  let playQueue = [];         // FIFO of Float32 bot samples
+  let playerNode = null;      // ScriptProcessor for playback
+  let scriptNodeSender = null;// ScriptProcessor for mic→WS
+  let micStream = null;
+  let float32Queue = [];      // FIFO of Float32 mic samples
+  const TARGET_SAMPLE_RATE = 16000;
+  let micSampleRate = 48000;
+  let isBotSpeaking = false;  // <— flag: bot audio is currently playing
+
+  // On page‐load / after user gesture, build AudioContext + playback node
+  window.addEventListener('load', async () => {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    await audioContext.resume();                 // ensures sampleRate is correct
+    playbackRate = audioContext.sampleRate;      // often 48000, but can change with echo cancellation
+    console.log("[DEBUG] playbackRate =", playbackRate);
+
+    // Build a single continuous playback node (drains playQueue)
+    playerNode = audioContext.createScriptProcessor(4096, 1, 1);
+    playerNode.onaudioprocess = (ev) => {
+      const output = ev.outputBuffer.getChannelData(0);
+      for (let i = 0; i < output.length; i++) {
+        if (playQueue.length > 0) {
+          output[i] = playQueue.shift();
+        } else {
+          output[i] = 0;
+          // Once queue is empty, bot is done speaking
+          if (isBotSpeaking) {
+            isBotSpeaking = false;
+            console.log("[DEBUG] isBotSpeaking → false (playQueue drained)");
+          }
+        }
+      }
+    };
+    playerNode.connect(audioContext.destination);
+  });
+
+  // Put microphone frames into Deepgram only when isBotSpeaking=false
+  function startMicStreaming(ws) {
+    const bufferSize = 4096;
+    scriptNodeSender = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+    const micSource = audioContext.createMediaStreamSource(micStream);
+    micSource.connect(scriptNodeSender);
+    // We don’t connect sender → destination (we only capture, not hear ourselves)
+
+    scriptNodeSender.onaudioprocess = (event) => {
+      // If bot is speaking, skip sending mic frames entirely
+      if (isBotSpeaking) return;
+
+      const inData = event.inputBuffer.getChannelData(0);
+      float32Queue.push(new Float32Array(inData));
+      let totalSamples = float32Queue.reduce((sum, arr) => sum + arr.length, 0);
+      const needed = Math.ceil((micSampleRate / TARGET_SAMPLE_RATE) * 320);
+      if (totalSamples < needed) return;
+
+      // Merge all queued floats
+      const merged = new Float32Array(totalSamples);
+      let offset = 0;
+      float32Queue.forEach(chunk => {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      });
+
+      // Linear downsample to 16kHz
+      const ratio = micSampleRate / TARGET_SAMPLE_RATE;
+      const newLen = Math.floor(merged.length / ratio);
+      const down = new Float32Array(newLen);
+      for (let i = 0; i < newLen; i++) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(merged.length, Math.floor((i+1) * ratio));
+        let sum = 0, count = 0;
+        for (let j = start; j < end; j++) {
+          sum += merged[j];
+          count++;
+        }
+        down[i] = count > 0 ? (sum / count) : 0;
+      }
+
+      // Send 320‑sample (20 ms) blocks as Int16 to WS
+      let i = 0;
+      while (i + 320 <= down.length) {
+        const slice = down.subarray(i, i + 320);
+        const int16 = new Int16Array(320);
+        for (let k = 0; k < 320; k++) {
+          const s = Math.max(-1, Math.min(1, slice[k]));
+          int16[k] = (s < 0 ? s * 0x8000 : s * 0x7fff);
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(int16.buffer);
+        }
+        i += 320;
+      }
+
+      // Keep leftover for the next callback
+      const leftoverIn = Math.round((down.length - i) * ratio);
+      const leftover = merged.subarray(merged.length - leftoverIn);
+      float32Queue = [leftover];
+    };
+
+    // Actually connect to kick off the mic grab
+    scriptNodeSender.connect(audioContext.destination);
+  }
+
+  // Whenever we get a binary chunk from the server, push floats into playQueue, set isBotSpeaking=true
+  function handleBinaryFrame(arrayBuffer) {
+    const pcm16 = new Int16Array(arrayBuffer);
+    const floats48k = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i++) {
+      floats48k[i] = pcm16[i] / 32768;
+    }
+    // If playbackRate ≠ 48000, do on‑the‑fly linear resampling
+    if (playbackRate !== 48000) {
+      const ratio = 48000 / playbackRate;
+      const newLen = Math.round(floats48k.length / ratio);
+      const resampled = new Float32Array(newLen);
+      for (let i = 0; i < newLen; i++) {
+        const idx = i * ratio;
+        const i0 = Math.floor(idx);
+        const i1 = Math.min(floats48k.length - 1, i0 + 1);
+        const w = idx - i0;
+        resampled[i] = (1 - w) * floats48k[i0] + w * floats48k[i1];
+      }
+      // Append resampled floats to queue
+      for (let f of resampled) {
+        playQueue.push(f);
+      }
+    } else {
+      // No resampling needed at 48 kHz
+      for (let f of floats48k) {
+        playQueue.push(f);
+      }
+    }
+
+    // As soon as the first frame arrives, we know the bot has started speaking
+    if (!isBotSpeaking) {
+      isBotSpeaking = true;
+      console.log("[DEBUG] isBotSpeaking → true (new chunk received)");
+    }
+  }
+
+  // Build & manage the WebSocket, attach JSON/binary handlers
+  function setupWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      console.log('[WS] Connection opened');
+      // If you want to flush any leftover bot audio, you can do so here:
+      // playQueue = []; isBotSpeaking = false;
+    };
+
+    ws.onclose = () => console.log('[WS] Connection closed');
+    ws.onerror = (err) => console.error('[WS] Error:', err);
+
+    ws.onmessage = (evt) => {
+      if (evt.data instanceof ArrayBuffer) {
+        // Incoming TTS chunk
+        console.log('[WS] → Binary chunk, length =', evt.data.byteLength);
+        handleBinaryFrame(evt.data);
+      }
+      else if (evt.data instanceof Blob) {
+        // Some browsers send Blob instead of raw ArrayBuffer
+        evt.data.arrayBuffer().then(ab => {
+          console.log('[WS] → Blob→ArrayBuffer, length =', ab.byteLength);
+          handleBinaryFrame(ab);
+        });
+      }
+      else {
+        // JSON‐format transcript/token
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'transcript') {
+            const label = msg.final ? 'FINAL' : 'INTERIM';
+            document.getElementById('transcripts').textContent +=
+              `TRANSCRIPT [${label}]: ${msg.text}\n`;
+          } else if (msg.type === 'token') {
+            document.getElementById('transcripts').textContent += msg.token;
+          }
+        } catch (e) {
+          console.warn('[WS] Non‑JSON message:', evt.data);
+        }
+      }
+    };
+
+    return ws;
+  }
+
+  // Start the entire mic→WS→TTS cycle when the user clicks Start
+  async function startStreaming() {
+    // 1) Resume AudioContext (user gesture)
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+      console.log('[DEBUG] audioContext resumed; state =', audioContext.state);
+    }
+
+    // 2) Open WebSocket & begin playback (handled by onmessage and playerNode)
+    const ws = setupWebSocket();
+
+    // 3) Grab mic (with echo cancellation/noise suppression), start sending frames
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+      micSampleRate = audioContext.sampleRate; // usually still 48000
+      startMicStreaming(ws);
+    } catch(err) {
+      console.error('[UI] getUserMedia error:', err);
+    }
+  }
+
+  // Wire it to your Start/Stop button
+  document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('startStopBtn');
+    let streaming = false;
+
+    btn.addEventListener('click', async () => {
+      if (!streaming) {
+        btn.textContent = 'Stop';
+        streaming = true;
+        await startStreaming();
+      } else {
+        btn.textContent = 'Start';
+        streaming = false;
+        // Tear down mic, WS, and queue
+        if (scriptNodeSender) {
+          scriptNodeSender.disconnect();
+          scriptNodeSender.onaudioprocess = null;
+          scriptNodeSender = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach(t => t.stop());
+          micStream = null;
+        }
+        float32Queue = [];
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+        playQueue = [];
+        isBotSpeaking = false;
+      }
+    });
+  });
+</script> -->
+
+<script src="/static/app.js"></script>
+</body>
+</html>
+
+
+
