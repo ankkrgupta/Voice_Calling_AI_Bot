@@ -25,9 +25,10 @@ class TTSClient:
                 audio_iter = self.client.text_to_speech.stream(
                     text=text,
                     voice_id=self.voice_id,
-                    model_id="eleven_multilingual_v2",
+                    # model_id="eleven_multilingual_v2",
+                    model_id="eleven_flash_v2_5",
                     optimize_streaming_latency=2,
-                    output_format="pcm_22050",
+                    output_format="pcm_44100",
                 )
                 break
             except Exception as e:
