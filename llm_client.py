@@ -107,7 +107,7 @@ class LLMClient:
             Goal: Helping the officials and users by giving precise information about what they ask regarding zomato focusing on the document shared. 
 
             Conversation Rules:
-            - Greet the customer only once at the start, but the greeting should be atleast 40 words long.
+            - Greet the customer only once at the start, but the greeting should be atmost 10 words long.
             - Do not reintroduce yourself or greet repeatedly.
             - Do not fabricate details; if unknown, offer to follow up.
             - Keep responses short and engaging (max 30 words).

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -50,9 +50,12 @@
   <script src="/static/app.js"></script>
 
 </body>
-</html> 
+</html>  -->
 
-<!-- <!DOCTYPE html>
+
+<!--- More responsive UI for Multiple Languages-->
+
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -62,9 +65,60 @@
     body {
       font-family: Arial, sans-serif;
       padding: 20px;
+      max-width: 600px;
+      margin: auto;
     }
-    #controls {
+    h1 {
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+    #langControls, #controls {
       margin-bottom: 20px;
+    }
+    #langControls label {
+      font-weight: bold;
+      display: block;
+      margin-bottom: 8px;
+    }
+    .langBtn {
+      padding: 10px 20px;
+      font-size: 16px;
+      border-radius: 5px;
+      border: none;
+      background-color: #007bff;
+      color: white;
+      cursor: pointer;
+      margin-right: 8px;
+      transition: background-color 0.2s;
+    }
+    .langBtn.selected {
+      background-color: #0056b3;
+    }
+    .langBtn:disabled {
+      background-color: #aaa;
+      cursor: default;
+    }
+    #startStopBtn {
+      padding: 10px 20px;
+      font-size: 16px;
+      border-radius: 5px;
+      border: none;
+      background-color: #28a745;
+      color: white;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    #startStopBtn.stop {
+      background-color: #dc3545;
+    }
+    #startStopBtn:disabled {
+      background-color: #aaa;
+      cursor: default;
+    }
+    #info {
+      margin-top: 10px;
+      font-style: italic;
+      color: #333;
     }
     #transcripts {
       width: 100%;
@@ -74,40 +128,29 @@
       overflow-y: auto;
       white-space: pre-wrap;
       background: #f9f9f9;
-    }
-    button {
-      padding: 10px 20px;
-      font-size: 16px;
-      border-radius: 5px;
-      border: none;
-      background-color: #007bff;
-      color: white;
-      cursor: pointer;
-      margin-right: 8px; /* small gap between buttons */
-    }
-    button:disabled {
-      background-color: #aaa;
-      cursor: default;
+      margin-top: 20px;
     }
   </style>
 </head>
-<body> -->
-  <!--
-  ─── Language‐toggle buttons ───────────────────────────────────────────
-  <div id="langControls" style="margin-bottom: 10px;">
-    <button class="langBtn" data-lang="en-IN">English (IN)</button>
-    <button class="langBtn" data-lang="hi">Hindi</button>
-    <button class="langBtn" data-lang="multi">Multi</button>
+<body>
+  <h1>Conversational AI Demo</h1>
+
+  <!-- ─── Language‐toggle buttons ─────────────────────────────────────────── -->
+  <div id="langControls">
+    <label>Select language:</label>
+    <button class="langBtn selected" data-lang="en-IN">English (IN)</button>
+    <button class="langBtn" data-lang="multi">Multi (Hinglish)</button>
   </div>
 
-  ─── Start/Stop button ───────────────────────────────────────────────────
+  <!-- ─── Start/Stop button and info message ─────────────────────────────────── -->
   <div id="controls">
-    <button id="startStopBtn">Start</button>
+    <button id="startStopBtn">Start the Conversation</button>
+    <div id="info"></div>
   </div>
 
-  ─── Transcript output area ──────────────────────────────────────────────
+  <!-- ─── Transcript output area ────────────────────────────────────────────── -->
   <div id="transcripts" readonly></div>
 
   <script src="/static/app.js"></script>
 </body>
-</html> -->
+</html>

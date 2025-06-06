@@ -161,7 +161,7 @@ class DeepgramTranscriber:
             smart_format=True,
             model="nova-3",
             encoding="linear16",
-            keyterm="Zomato",
+            # keyterm="Zomato",
             sample_rate=self.sample_rate,
             channels=1,
             interim_results=self.interim,
@@ -169,6 +169,22 @@ class DeepgramTranscriber:
             endpointing=300,
             language=self.language,
         )
+
+        # from urllib.parse import urlencode
+
+        # query = {
+        #     "model":          opts.model,
+        #     "language":       opts.language,
+        #     "encoding":       opts.encoding,
+        #     "sample_rate":    opts.sample_rate,
+        #     "interim_results": str(opts.interim_results).lower(),
+        #     "smart_format":   str(opts.smart_format).lower(),
+        #     "vad_events":     str(opts.vad_events).lower(),
+        #     "endpointing":    opts.endpointing,
+        #     "keyterm":        opts.keyterm or "",
+        # }
+        # ws_url = f"wss://api.deepgram.com/v1/listen?{urlencode(query)}"
+        # print(f"[STT DEBUG] Deepgram WS URL → {ws_url}")
 
         # Starting streaming in a thread, since .start() is blocking
         try:
