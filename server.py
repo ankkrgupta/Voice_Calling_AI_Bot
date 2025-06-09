@@ -991,3 +991,204 @@ async def websocket_endpoint(ws: WebSocket):
         stt.finish()
         stt_thread.join(timeout=2)
         await ws.close()
+
+
+'''Reducing Latency (Try 2)'''
+import os
+import re
+import asyncio
+import time
+import threading
+import numpy as np
+from scipy.signal import resample_poly
+from os.path import exists
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from deepgram_stt import DeepgramTranscriber
+from llm_client import LLMClient
+from elevenlabs.client import ElevenLabs
+from dotenv import load_dotenv
+from typing import Optional
+from rag_module_integration import RAGEngine
+import json
+
+# Load environment variables
+load_dotenv()
+DG_KEY = os.getenv("DEEPGRAM_API_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
+PDF_PATH = os.getenv("ZOMATO_PDF_PATH", "Zomato_Annual_Report_2023-24.pdf")
+INDEX_PATH = os.getenv("ZOMATO_INDEX_PATH", "zomato_index.faiss")
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static files
+@app.get("/")
+async def read_index():
+    return FileResponse("static/index.html")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Instantiate ElevenLabs client once
+el_client = ElevenLabs(api_key=ELEVEN_KEY) if ELEVEN_KEY else None
+
+# Initialize or load RAG index
+rag_engine = RAGEngine(
+    openai_api_key=OPENAI_KEY,
+    pdf_path=PDF_PATH,
+    index_path=INDEX_PATH
+)
+if not exists(INDEX_PATH):
+    rag_engine.build_index()
+else:
+    rag_engine.load_index()
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    chosen_language = ws.query_params.get("lang", "en-IN")
+    print(f"[Server] Starting STT with language = {chosen_language}")
+
+    llm = LLMClient(OPENAI_KEY, rag_engine)
+    llm.reset()
+
+    # Stability heuristic state
+    last_interim: str = ""
+    last_interim_ts: float = 0.0
+    spec_launched: bool = False
+
+    async def launch_llm(text: str):
+        nonlocal spec_launched, last_interim
+        t_llm_start = time.perf_counter()
+        print(f"[{t_llm_start:.3f}] → sending to LLM (text='{text[:30]}...')")
+
+        buffer_text = ""
+        last_emit_ts = time.perf_counter()
+        emit_interval = 0.1  # seconds
+        chunk_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        async def speaker_task():
+            if not el_client:
+                return
+            first_chunk = False
+            t_tts_start = None
+            while True:
+                chunk_text = await chunk_queue.get()
+                if chunk_text is None:
+                    break
+                try:
+                    audio_iter = el_client.text_to_speech.stream(
+                        text=chunk_text,
+                        voice_id=VOICE_ID,
+                        model_id="eleven_flash_v2_5",
+                        output_format="pcm_44100",
+                    )
+                except Exception as e:
+                    print(f"[Server] TTS error: {e}")
+                    continue
+
+                for pcm_chunk in audio_iter:
+                    if not first_chunk and pcm_chunk:
+                        t_tts_start = time.perf_counter()
+                        print(f"[{t_tts_start:.3f}] ← first TTS chunk for '{chunk_text[:30]}...'" )
+                        first_chunk = True
+                    arr_22050 = np.frombuffer(pcm_chunk, dtype=np.int16)
+                    arr_48000 = resample_poly(arr_22050, up=48000, down=44100)
+                    arr_48000 = np.clip(arr_48000, -32768, 32767).astype(np.int16)
+                    await ws.send_bytes(arr_48000.tobytes())
+
+            if t_tts_start:
+                print(f"[TIMING] Total TTS time: {time.perf_counter() - t_tts_start:.3f} sec")
+
+        speaker = asyncio.create_task(speaker_task())
+
+        response_buffer = ""
+        first_token_logged = False
+        last_token_ts = None
+        try:
+            async for token in llm.stream_response(text):
+                now = time.perf_counter()
+
+                # Log first LLM token timestamp
+                if not first_token_logged and token:
+                    print(f"[{now:.3f}] ← first LLM token")
+                    first_token_logged = True
+                # Track last token timestamp
+                last_token_ts = now
+
+                await ws.send_json({"type": "token", "token": token})
+                buffer_text += token
+                # Emit buffered text every emit_interval or on punctuation
+                # if (now - last_emit_ts) >= emit_interval or re.search(r"[\.!,?]$", buffer_text):
+                if re.search(r"[\.!,?]$", buffer_text):
+                    print(time.perf_counter())
+                    await chunk_queue.put(buffer_text)
+                    buffer_text = ""
+                    last_emit_ts = now
+
+            # After streaming ends, log last token
+            if last_token_ts:
+                print(f"[{last_token_ts:.3f}] ← last LLM token")
+
+            # Emit any remaining buffer
+            if buffer_text.strip():
+                await chunk_queue.put(buffer_text)
+            await ws.send_json({"type": "response_end"})
+        finally:
+            await chunk_queue.put(None)
+            await speaker
+            t_llm_end = time.perf_counter()
+            print(f"[TIMING] LLM inference took {t_llm_end - t_llm_start:.3f} sec")
+            # Reset state for next utterance
+            spec_launched = False
+            last_interim = ""
+
+    async def on_transcript(text: str, is_final: bool):
+        nonlocal last_interim, last_interim_ts, spec_launched
+        # Forward every transcript
+        await ws.send_json({"type": "transcript", "text": text, "final": is_final})
+        now = time.perf_counter()
+
+        if not is_final:
+            if len(text.split()) >= 5:
+                if (text == last_interim or (now - last_interim_ts) >= 0.15) and not spec_launched:
+                    spec_launched = True
+                    print(f"[{now:.3f}] [STT] stable interim: '{text}'")
+                    asyncio.create_task(launch_llm(text))
+                elif text != last_interim:
+                    last_interim = text
+                    last_interim_ts = now
+            return
+
+        # On final (fallback)
+        if not spec_launched:
+            spec_launched = True
+            print(f"[{now:.3f}] [STT] final transcript kickoff: '{text}'")
+            asyncio.create_task(launch_llm(text))
+
+    # Start STT
+    stt = DeepgramTranscriber(DG_KEY, use_mic=False, language=chosen_language)
+    llm.reset()
+    asyncio.create_task(on_transcript("", True))
+    # def stt_runner():
+    #     asyncio.run(stt.start(on_transcript))
+    threading.Thread(target=lambda: asyncio.run(stt.start(on_transcript)), daemon=True).start()
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("bytes") is not None:
+                stt.feed_audio(msg["bytes"])
+            elif msg.get("type") == "websocket.disconnect":
+                break
+    finally:
+        stt.finish()
+        await ws.close()
