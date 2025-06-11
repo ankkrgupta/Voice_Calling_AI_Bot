@@ -4,7 +4,6 @@ import asyncio
 import time
 import threading
 import numpy as np
-from scipy.signal import resample_poly
 from os.path import exists
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,6 +68,7 @@ async def websocket_endpoint(ws: WebSocket):
     last_interim: str = ""
     last_interim_ts: float = 0.0
     spec_launched: bool = False
+    last_user_end_ts: Optional[float] = None
 
     # Helper: speak a sentence chunk concurrently
     async def speak_sentence(sentence: str):
@@ -90,17 +90,18 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"[Server] TTS error: {e}")
             return
 
+        first = True
         for pcm_chunk in audio_iter:
             if not pcm_chunk:
                 continue
             if first:
                 t0 = time.perf_counter()
+                print(last_user_end_ts)
+                if last_user_end_ts is not None:
+                    latency = t0 - last_user_end_ts
+                    print(f"[LATENCY] User→TTS startup: {latency:.3f} sec")
                 print(f"[{t0:.3f}] ← first TTS chunk for '{sentence[:30]}...'" )
                 first = False
-            # arr_22050 = np.frombuffer(pcm_chunk, dtype=np.int16)
-            # arr_48000 = resample_poly(arr_22050, up=48000, down=44100)
-            # arr_48000 = np.clip(arr_48000, -32768, 32767).astype(np.int16)
-            # await ws.send_bytes(arr_48000.tobytes())
             await ws.send_bytes(pcm_chunk)
         if t0:
             print(f"[TIMING] TTS for sentence took {time.perf_counter()-t0:.3f} sec")
@@ -156,7 +157,7 @@ async def websocket_endpoint(ws: WebSocket):
             last_interim = ""
 
     async def on_transcript(text: str, is_final: bool):
-        nonlocal last_interim, last_interim_ts, spec_launched
+        nonlocal last_interim, last_interim_ts, spec_launched, last_user_end_ts
         await ws.send_json({"type": "transcript", "text": text, "final": is_final})
         now = time.perf_counter()
 
@@ -164,13 +165,14 @@ async def websocket_endpoint(ws: WebSocket):
             if len(text.split()) >= 3:
                 if text == last_interim and (now - last_interim_ts) >= 0.15 and not spec_launched:
                     spec_launched = True
+                    last_user_end_ts = now
                     print(f"[{now:.3f}] [STT] stable interim: '{text}'")
                     asyncio.create_task(launch_llm(text))
                 elif text != last_interim:
                     last_interim = text
                     last_interim_ts = now
             return
-
+        last_user_end_ts = now
         if not spec_launched:
             spec_launched = True
             print(f"[{now:.3f}] [STT] final transcript kickoff: '{text}'")

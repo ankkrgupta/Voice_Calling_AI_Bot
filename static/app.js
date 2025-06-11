@@ -9,115 +9,91 @@
 // ───────────────────────────────────────────────────────────────────────────────
 
 let audioContext = null;
-let playbackRate = null;           // AudioContext.sampleRate (48k, 16k, etc.)
-let playProcessorNode = null;       // AudioWorkletNode("playback-processor")
-
-let scriptNodeSender = null;        // ScriptProcessorNode for mic→WS
+let playProcessorNode = null;
+let captureCtx = null;
+let scriptNodeSender = null;
 let micStream = null;
-let ws = null;                      // WebSocket instance
+let ws = null;
 
-let float32Queue = [];              // FIFO of Float32 mic samples
+let float32Queue = [];                // FIFO of Float32 mic samples
 const TARGET_SAMPLE_RATE = 16000;
-// let micSampleRate = 48000;
+let micSampleRate = null;
 
-// When all queued samples finish, playbackEndTime marks the AudioContext time + 50 ms safety
 let playbackEndTime = 0;
+let playbackRate = null;
 
-// ─── LANGUAGE STATE ────────────────────────────────────────────────────────────
-// Start with English‐IN by default. Clicking a .langBtn updates this variable,
-// and the “selected” CSS class gets toggled for visual feedback.
-let selectedLanguage = "en-IN";
+let selectedLanguage = "en-IN";       // default lang
 
-// ─── On load: create AudioContext + load Worklet ───────────────────────────────
-window.addEventListener("load", async () => {
-  audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  await audioContext.resume();
-
-  playbackRate = audioContext.sampleRate;  // e.g. 48000, 16000, etc.
-  console.log("[DEBUG] audioContext.sampleRate =", playbackRate);
-
-  micSampleRate = audioContext.sampleRate;
-  
-  // 1) Add the playback-processor module
-  try {
-    await audioContext.audioWorklet.addModule("/static/playback-processor.js");
-  } catch (err) {
-    console.error("[ERROR] Could not load playback-processor.js:", err);
-    return;
-  }
-
-  // 2) Create the AudioWorkletNode
-  playProcessorNode = new AudioWorkletNode(audioContext, "playback-processor");
-  // Connect it to the destination so it actually outputs sound:
-  playProcessorNode.connect(audioContext.destination);
-
-  console.log("[DEBUG] AudioWorkletNode(playback-processor) created");
-
-  // ─── Wire up language buttons so that clicking one toggles “selected” class ───
+window.addEventListener("load", () => {
+  // Language buttons
   document.querySelectorAll(".langBtn").forEach(btn => {
     btn.addEventListener("click", () => {
-      // Remove “selected” from all, then add to the one clicked
       document.querySelectorAll(".langBtn").forEach(b => b.classList.remove("selected"));
       btn.classList.add("selected");
-
-      // Update our local state
-      selectedLanguage = btn.getAttribute("data-lang");
+      selectedLanguage = btn.dataset.lang;
       console.log(`[UI] Selected language = ${selectedLanguage}`);
     });
   });
 
-  // ─── Wire up Start/Stop button ──────────────────────────────────────────────
+  // Start/Stop button
   const startStopBtn = document.getElementById("startStopBtn");
   let streaming = false;
 
   startStopBtn.addEventListener("click", async () => {
     if (!streaming) {
-      // 1) Change to “Stop” style
+      // ─── USER CLICKED “START” ───────────────────────────────────────
+      streaming = true;
       startStopBtn.textContent = "Stop the Conversation";
       startStopBtn.classList.add("stop");
-      streaming = true;
+      document.getElementById("info").textContent =
+        selectedLanguage === "en-IN"
+          ? "Current language of conversation is English. " + "If you want to shift to Multi, select it above, then stop the ongoing conversation and click on start conversation button again."
+          : "Current language of conversation is Hinglish. " + "If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.";
 
-      // 2) Show informational message about current language
-      const infoDiv = document.getElementById("info");
-      if (selectedLanguage === "en-IN") {
-        infoDiv.textContent = 
-          "Current language of conversation is English. " +
-          "If you want to shift to Multi, select it above, then stop the ongoing conversation and click on start conversation button again.";
-      } else {
-        infoDiv.textContent = 
-          "Current language of conversation is Multi (Hinglish). " +
-          "If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.";
-      }
+      // 1) Create & resume playback AudioContext
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      await audioContext.resume();
+      playbackRate = audioContext.sampleRate;
+      console.log("[AUDIO] Playback resumed, rate =", playbackRate);
 
-      // 3) Kick off WebSocket + mic capture
+      // 2) Load & instantiate the AudioWorklet for TTS playback
+      await audioContext.audioWorklet.addModule("/static/playback-processor.js");
+      playProcessorNode = new AudioWorkletNode(audioContext, "playback-processor");
+      playProcessorNode.connect(audioContext.destination);
+      console.log("[AUDIO] Worklet loaded & connected");
+
+      // 3) Create & resume capture AudioContext
+      captureCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await captureCtx.resume();
+      micSampleRate = captureCtx.sampleRate;
+      console.log("[AUDIO] Capture resumed, rate =", micSampleRate);
+
+      // 4) Kick off WebSocket + mic capture
       await startStreaming();
+
     } else {
-      // Stop the conversation
+      // ─── USER CLICKED “STOP” ────────────────────────────────────────
+      streaming = false;
       startStopBtn.textContent = "Start the Conversation";
       startStopBtn.classList.remove("stop");
-      streaming = false;
-
-      // Clear the informational message
       document.getElementById("info").textContent = "";
 
-      // Tear down mic processing
+      // Tear down mic
       if (scriptNodeSender) {
         scriptNodeSender.disconnect();
         scriptNodeSender.onaudioprocess = null;
         scriptNodeSender = null;
       }
       if (micStream) {
-        micStream.getTracks().forEach((t) => t.stop());
+        micStream.getTracks().forEach(t => t.stop());
         micStream = null;
       }
       float32Queue = [];
 
-      // Close WebSocket (if open)
+      // Close WS
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
-
-      // Reset playback queue + end time
       playbackEndTime = 0;
     }
   });
