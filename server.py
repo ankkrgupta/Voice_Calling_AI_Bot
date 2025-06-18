@@ -1,4 +1,5 @@
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
 import asyncio
 import time
@@ -22,6 +23,7 @@ import json
 load_dotenv()
 DG_KEY = os.getenv("DEEPGRAM_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 PDF_PATH = os.getenv("ZOMATO_PDF_PATH", "Zomato_Annual_Report_2023-24.pdf")
@@ -50,11 +52,16 @@ rag_engine = RAGEngine(
     pdf_path=PDF_PATH,
     index_path=INDEX_PATH
 )
-if not exists(INDEX_PATH):
+
+idx_file  = f"{INDEX_PATH}/hnsw_index.bin"
+data_file = f"{INDEX_PATH}/id2text.pkl"
+meta_file = f"{INDEX_PATH}/meta.pkl"
+
+if not (exists(idx_file) and exists(data_file) and exists(meta_file)):
+    print("[RAG] index files missing, building from scratch…")
     rag_engine.build_index()
 else:
-    # rag_engine.load_index()
-    rag_engine.load_index(f"{INDEX_PATH}/hnsw_index.bin", f"{INDEX_PATH}/id2text.pkl", f"{INDEX_PATH}/meta.pkl")
+    rag_engine.load_index(idx_file, data_file, meta_file)
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -63,7 +70,7 @@ async def websocket_endpoint(ws: WebSocket):
     print(f"[Server] Starting STT with language = {chosen_language}")
     chosen_lang_el = "en" if chosen_language=="en-IN" else "hi"
     user_phone = "6306061252"
-    llm = LLMClient(OPENAI_KEY, rag_engine, customer_phone=user_phone)
+    llm = LLMClient(GROQ_KEY, OPENAI_KEY, rag_engine, customer_phone=user_phone)
 
     transcripts: List[str] = []
     last_interim: str = ""

@@ -1,4 +1,4 @@
-# Voice Calling AI Agent (Deepgram -> gpt-3.5-turbo-1106 -> Elevenlabs)
+# Voice Calling AI Agent (Deepgram -> groq llama3-70b-8192 -> Elevenlabs)
 
 ## Setup Instructions
 

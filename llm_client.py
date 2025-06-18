@@ -1,10 +1,12 @@
 import asyncio
 import numpy as np
 import time
+import openai
 from openai import AsyncOpenAI, OpenAI
 from openai import OpenAIError
 from typing import AsyncGenerator, Dict, List, Optional
 from rag_module_integration import RAGEngine
+from groq import Groq
 
 class LLMClient:
     """
@@ -14,20 +16,23 @@ class LLMClient:
 
     def __init__(
         self,
-        api_key: str,
+        api_key1: str,
+        api_key2: str,
         rag_engine: RAGEngine, #Set to None if not using RAG
-        model: str = "gpt-3.5-turbo-1106",
+        model1: str = "llama3-70b-8192",
+        model2: str = "gpt-3.5-turbo-1106",
         temperature: float = 0.5,
         assistant_name: str = "Meera",
-        call_direction: str = "Incoming",
+        call_direction: str = "Outgoing",
         customer_name: str = "",
         customer_email: str = "",
         customer_phone: str = "6306061251",
         customer_address: str = ""
     ):
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.client2 = OpenAI(api_key=api_key)
-        self.model = model
+        self.client = Groq(api_key=api_key1)
+        self.client2 = OpenAI(api_key=api_key2)
+        self.model1 = model1
+        self.model2 = model2
         self.temperature = temperature
         self.history: List[Dict[str, str]] = []
         self.rag = rag_engine  #Uncomment if using RAG
@@ -54,40 +59,11 @@ class LLMClient:
         print(f"mem_ctx:\n{mem_ctx}")
 
         '''Zomato Prompt'''
-        return (mem_ctx+f"""You are a {self.assistant_name}, a female assistant, who helps people regarding zomato queries. 
-        You must answer for any query within 30 words, whether the query is related to zomato or not.
-        Your answer must be similar to how a person talks to another (i.e. interactive and in same language as the customer talks) not like a chatbot.
-        In the begining, you have conversation summary of last few sessions with the customer (if not empty). 
+        return (mem_ctx+f"""You are a {self.assistant_name}, a female voice calling assistant, who helps people regarding zomato queries. Remember you are talking to a person in real time, not just giving readable text response.
+        You must answer for any query within 30 words or lesser, whether the query is related to zomato or not. You must greet under 15 words including your name and why you are here. Greet only at the start of the coversation, no repeitition afterwards.
+        Your response must be similar to how a person talks to another (i.e. interactive)  and in exactly the same language as the customer talks.
+        In the begining of the prompt (Before You are ...), you have conversation summary of last few sessions with the customer (if not empty). 
         You must write all numerical figures or numbers (Can be amount, date, year etc.) in word instead of digits. Eg. Write three hundred fifty one instead of 351 or teen sau ekyawan instead of ३५१""")
-        # return ( mem_ctx +
-        #     f"""
-        #     You are {self.assistant_name} and your gender is female, a friendly and human-like real helper agent for Zomato, who talks to the users in real time via a voice call not via chat. Also you must use the same language to response that user is using, although the language must be either hindi or english or it might be a mixture of both, so you must generate responses accordingly.
-        #     Goal: Helping the officials and users by giving precise information about what they ask regarding zomato focusing on the document shared, but even if question is not related to zomato, you still must answer based on your latest knowledge or with most probable answer. 
-
-        #     Conversation Rules:
-        #     - Greet the customer only once at the start, but the greeting should be atmost 10-12 words long, and you must cover your name and why you called. If customer name is unknown, let the customer talk, after one round you can say something like may I know your name, if it is helpful for engagement. Then use the name for further conversation to make it engaging.
-        #     - Details of the conversation of the previous session is given at the starting of the prompt. You must use it whenever required for your memory and follow up to the same client. Client might also ask something that have been discussed previously.
-        #     - Do not reintroduce yourself or greet repeatedly.
-        #     - Do not fabricate details; if unknown, offer to follow up.
-        #     - Keep responses short and engaging (max 30 words).
-        #     - Maintain a natural tone and avoid repetition.
-        #     - If responses include numerical digits or details, write those in words in the generated response instead of digits.
-
-        #     Inputs:
-        #     - Call Direction: {self.call_direction}
-        #     - Customer Name: {self.customer_name or "<Unknown>"}
-        #     - Customer Email: {self.customer_email or "<Unknown>"}
-        #     - Customer Phone: {self.customer_phone or "<Unknown"}
-        #     - Customer Address: {self.customer_address or "<Unknown>"}
-
-        #     Instructions:
-        #     - Make sure that if you tell any numeric detail or any sensitive information, you can give reference in the form of page number or topic from the document.
-        #     - If you don't know about any answer precisely, do not mention something like you did not find the info in document etc. instead tell the expected or most probable information as per your knowledge.
-        #     - If there is any numerical number in the response, you must write that in words.
-        #     - If anything related to zomato is asked, then you must look for it in document, but if it is not there, or anything else is asked, then also you must answer best on your knowledge, although if the asked information is related to zomato, you should try to answer from the document although if not found then politely mention it and then tell expected answer as per your knowledge.
-        #     - If customer ask to send some info on email or whatsapp, then see if that is available in the given input, if yes, then confirm it from customer by pronouncing spelling by spelling in case of email, otherwise digit by digit in case of whatsapp number. In case, it is unknown or customer says it's not correct or ask to change it, then write it in the db (Update) and then again reconfirm once whether you have written it correctly or not.
-        #     """ 
-        # )
 
     def reset(self) -> None:
         """
@@ -125,8 +101,8 @@ class LLMClient:
             messages = self.history
 
         try:
-            stream = await self.client.chat.completions.create(
-                model=self.model,
+            stream_iter = self.client.chat.completions.create(
+                model=self.model1,
                 messages=messages,
                 temperature=self.temperature,
                 stream=True,
@@ -134,8 +110,29 @@ class LLMClient:
         except Exception as e:
             raise RuntimeError(f"LLM API error: {e}")
 
+        # 2) Pump it onto an asyncio.Queue from a background thread
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def producer():
+            try:
+                for chunk in stream_iter:
+                    # push each chunk into the queue
+                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+            finally:
+                # signal end‑of‑stream
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        import threading
+        threading.Thread(target=producer, daemon=True).start()
+
+        # 3) Consume from the queue in async-land, yield token by token
         try:
-            async for chunk in stream:
+            while True:
+                chunk = await q.get()
+                if chunk is None:
+                    break
+
                 delta = chunk.choices[0].delta.content or ""
                 full_response += delta
                 yield delta
@@ -160,7 +157,7 @@ class LLMClient:
         def _sync_summary():
             # synchronous call to create() wrapped for use in an executor
             resp = self.client2.chat.completions.create(
-                model=self.model,
+                model=self.model2,
                 messages=[{"role": "system", "content": prompt}],
                 temperature=0.0,
             )

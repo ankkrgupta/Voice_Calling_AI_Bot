@@ -75,6 +75,7 @@ class RAGEngine:
             self.fast_index.load_index(fast_idx)
             self.fast_index.set_ef(20)
 
+
     def build_index(self):
         # 1) Load PDF and split
         loader = PyPDFLoader(self.pdf_path)
