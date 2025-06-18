@@ -17,12 +17,6 @@ class DeepgramTranscriber:
     """
     Streams raw PCM audio to Deepgram for real-time transcription.
     Saves audio segments to disk when a final transcript is received.
-
-    Usage:
-        stt = DeepgramTranscriber(api_key, use_mic=False)
-        await stt.start(on_transcript_callback)
-        stt.feed_audio(pcm_bytes)  # if use_mic=False
-        stt.finish()  # to close connection
     """
 
     def __init__(
@@ -32,8 +26,8 @@ class DeepgramTranscriber:
         vad_mode: int = 2,
         silence_limit: float = 1.0,
         interim: bool = True,
-        # language: str = "en-IN",
-        language: str = "multi",
+        language: str = "en-IN",
+        # language: str = "hi",
         raw_output_dir: str = "recordings",
         use_mic: bool = False,
     ):
@@ -44,7 +38,7 @@ class DeepgramTranscriber:
         self.use_mic = use_mic
         self.language = language
 
-        # Prepare output directory for saving raw WAVs
+        # Preparing output directory for saving raw WAVs
         os.makedirs(raw_output_dir, exist_ok=True)
         self.raw_output_dir = raw_output_dir
 
@@ -162,15 +156,16 @@ class DeepgramTranscriber:
         opts = LiveOptions(
             punctuate=True,
             smart_format=True,
-            model="nova-3",
+            model="nova-2",
             encoding="linear16",
-            # keyterm="Zomato",
+            # keyterm="Zomato",  
             sample_rate=self.sample_rate,
             channels=1,
             interim_results=self.interim,
             # vad_events=True,
-            endpointing=100,
+            endpointing=200,
             language=self.language,
+            keywords=["Zomato", "EBITDA", "Profit", "Loss", "Revenue", "Numerical", "Figure"],
         )
 
         try:

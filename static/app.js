@@ -2,8 +2,8 @@
 //                                   app.js                                  
 // ───────────────────────────────────────────────────────────────────────────────
 //
-// Uses an AudioWorkletNode for TTS playback and a ScriptProcessorNode for mic capture.
-// You can pick “en-IN” or “multi” *before* clicking “Start the Conversation.” That
+// Using an AudioWorkletNode for TTS playback and a ScriptProcessorNode for mic capture.
+// User can pick “en-IN” or “Hindi” *before* clicking “Start the Conversation.” That
 // choice is sent as ?lang=<…> to the WebSocket URL. Once “Start” is clicked, an
 // informational message appears showing which language is in effect and how to change it.
 // ───────────────────────────────────────────────────────────────────────────────
@@ -17,11 +17,11 @@ let ws = null;
 
 let float32Queue = [];                // FIFO of Float32 mic samples
 const TARGET_SAMPLE_RATE = 16000;
+const TTS_SAMPLE_RATE    = 44100;
 let micSampleRate = null;
 
 let playbackEndTime = 0;
 let playbackRate = null;
-
 let selectedLanguage = "en-IN";       // default lang
 
 window.addEventListener("load", () => {
@@ -47,8 +47,8 @@ window.addEventListener("load", () => {
       startStopBtn.classList.add("stop");
       document.getElementById("info").textContent =
         selectedLanguage === "en-IN"
-          ? "Current language of conversation is English. " + "If you want to shift to Multi, select it above, then stop the ongoing conversation and click on start conversation button again."
-          : "Current language of conversation is Hinglish. " + "If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.";
+          ? "Current language of conversation is English. " + "If you want to shift to Hindi, select it above, then stop the ongoing conversation and click on start conversation button again."
+          : "Current language of conversation is Hindi. " + "If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.";
 
       // 1) Create & resume playback AudioContext
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -94,7 +94,17 @@ window.addEventListener("load", () => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
+
+      // Also close both AudioContexts so they don’t linger
       playbackEndTime = 0;
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+      if (captureCtx) {
+        captureCtx.close();
+        captureCtx = null;
+      }
     }
   });
 });
@@ -117,20 +127,20 @@ function downsampleBuffer(buffer, srcRate) {
   return result;
 }
 
-// ─── Resample Float32Array [48000 → playbackRate] (linear interpolation) ──────────
-function resample48kToPlayback(buffer48k) {
-  if (playbackRate === 44100) {
-    return buffer48k.slice(); // shallow copy if no resampling needed
+// ─── Resample Float32Array [TTS Sample Rate → playbackRate] (linear interpolation) ──────────
+function resampleTTSToPlayback(bufferTTS) {
+  if (playbackRate === TTS_SAMPLE_RATE) {
+    return bufferTTS.slice(); // shallow copy if no resampling needed
   }
-  const targetLen = Math.round((buffer48k.length * playbackRate) / 44100);
+  const targetLen = Math.round((bufferTTS.length * playbackRate) / TTS_SAMPLE_RATE);
   const result = new Float32Array(targetLen);
-  const ratio = 44100 / playbackRate;
+  const ratio = TTS_SAMPLE_RATE / playbackRate;
   for (let i = 0; i < targetLen; i++) {
     const idx = i * ratio;
     const i0 = Math.floor(idx);
-    const i1 = Math.min(buffer48k.length - 1, i0 + 1);
+    const i1 = Math.min(bufferTTS.length - 1, i0 + 1);
     const w = idx - i0;
-    result[i] = (1 - w) * buffer48k[i0] + w * buffer48k[i1];
+    result[i] = (1 - w) * bufferTTS[i0] + w * bufferTTS[i1];
   }
   return result;
 }
@@ -145,24 +155,26 @@ function floatToInt16(floatBuffer) {
   return int16;
 }
 
-// ─── When we receive an Int16@48k TTS chunk, convert, resample, and send ──────────
+// ─── When we receive an Int16@TTS SAMPLE RATE, TTS chunk, convert, resample, and send ──────────
 function handleBinaryFrame(arrayBuffer) {
-  // 1) Read raw 16-bit PCM @ 48 kHz
+  // 1) Read raw 16-bit PCM @ TTS SAMPLE RATE
+  console.log("[Client] 🔊 Received TTS chunk, byteLength =", arrayBuffer.byteLength);
+
   const pcm16 = new Int16Array(arrayBuffer);
   if (!pcm16.length) return;
 
-  // 2) Convert to Float32 @ 48 kHz
-  const floats48k = new Float32Array(pcm16.length);
+  // 2) Convert to Float32 @ TTS SAMPLE RATE
+  const floatsTTS = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) {
-    floats48k[i] = pcm16[i] / 32768;
+    floatsTTS[i] = pcm16[i] / 32768;
   }
 
-  // ─── Resample from 48 kHz → playbackRate, if needed ───────────────────
+  // ─── Resample from TTS SAMPLE RATE → playbackRate, if needed ───────────────────
   let toSend;
-  if (playbackRate !== 44100) {
-    toSend = resample48kToPlayback(floats48k);
+  if (playbackRate !== TTS_SAMPLE_RATE) {
+    toSend = resampleTTSToPlayback(floatsTTS);
   } else {
-    toSend = floats48k;
+    toSend = floatsTTS;
   }
 
   // 3) Post that (possibly resampled) Float32 chunk to the worklet’s port
@@ -196,29 +208,67 @@ function setupWebSocket() {
   ws.onclose = () => console.log("[WS] Connection closed");
 
   ws.onmessage = (evt) => {
-    if (evt.data instanceof ArrayBuffer) {
-      // Incoming TTS chunk → handle (convert/resample/send & update end time)
-      handleBinaryFrame(evt.data);
-    } else if (evt.data instanceof Blob) {
-      // Some browsers wrap bytes in a Blob
-      evt.data
-        .arrayBuffer()
-        .then((ab) => handleBinaryFrame(ab))
-        .catch((e) => console.error("[WS] Blob→ArrayBuffer error:", e));
-    } else {
-      // JSON control message: transcript or token
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg.type === "transcript") {
-          const label = msg.final ? "FINAL" : "INTERIM";
-          document.getElementById("transcripts").textContent +=
-            `\nTRANSCRIPT [${label}]: ${msg.text}\n`;
-        } else if (msg.type === "token") {
-          document.getElementById("transcripts").textContent += msg.token;
-        }
-      } catch {
-        console.warn("[WS] Non-JSON message:", evt.data);
+    // if (evt.data instanceof ArrayBuffer) {
+    //   // Incoming TTS chunk → handle (convert/resample/send & update end time)
+    //   handleBinaryFrame(evt.data);
+    // } else if (evt.data instanceof Blob) {
+    //   // Some browsers wrap bytes in a Blob
+    //   evt.data
+    //     .arrayBuffer()
+    //     .then((ab) => handleBinaryFrame(ab))
+    //     .catch((e) => console.error("[WS] Blob→ArrayBuffer error:", e));
+    // } else {
+    //   // JSON control message: transcript or token
+    //   try {
+    //     const msg = JSON.parse(evt.data);
+    //     if (msg.type === "transcript") {
+    //       const label = msg.final ? "FINAL" : "INTERIM";
+    //       document.getElementById("transcripts").textContent +=
+    //         `\nTRANSCRIPT [${label}]: ${msg.text}\n`;
+    //     } else if (msg.type === "token") {
+    //       document.getElementById("transcripts").textContent += msg.token;
+    //     }
+    //   } catch {
+    //     console.warn("[WS] Non-JSON message:", evt.data);
+    //   }
+    // }
+
+    // 1) Binary frames = TTS audio
+    if (evt.data instanceof ArrayBuffer || evt.data instanceof Blob) {
+      const handle = (ab) => handleBinaryFrame(ab);
+      if (evt.data instanceof Blob) {
+        evt.data.arrayBuffer().then(handle).catch(console.error);
+      } else {
+        handle(evt.data);
       }
+      return;
+    }
+
+    // 2) JSON control messages
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch {
+      console.warn("[WS] Non-JSON message:", evt.data);
+      return;
+    }
+
+    if (msg.type === "stop_speech") {
+      // Flush worklet buffer immediately
+      playProcessorNode.port.postMessage({ command: "flush" });
+      // Allow mic capture right away
+      playbackEndTime = 0;
+      console.log("[Client] Received stop_speech → flushing audio");
+      return;
+    }
+
+    if (msg.type === "transcript") {
+      const label = msg.final ? "FINAL" : "INTERIM";
+      document.getElementById("transcripts").textContent +=
+        `\nTRANSCRIPT [${label}]: ${msg.text}\n`;
+    }
+    else if (msg.type === "token") {
+      document.getElementById("transcripts").textContent += msg.token;
     }
   };
 
@@ -292,7 +342,7 @@ async function startStreaming() {
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true },
     });
-    micSampleRate = audioContext.sampleRate;
+    micSampleRate = captureCtx.sampleRate;
     console.log("[DEBUG] Mic sampleRate =", micSampleRate);
   } catch (err) {
     console.error("[UI] getUserMedia error:", err);

@@ -11,9 +11,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from deepgram_stt import DeepgramTranscriber
 from llm_client import LLMClient
-from elevenlabs.client import ElevenLabs
+from tts_client import TTSClient
 from dotenv import load_dotenv
-from typing import Optional
+from typing import List, Optional
+
 from rag_module_integration import RAGEngine
 import json
 
@@ -24,7 +25,8 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 PDF_PATH = os.getenv("ZOMATO_PDF_PATH", "Zomato_Annual_Report_2023-24.pdf")
-INDEX_PATH = os.getenv("ZOMATO_INDEX_PATH", "zomato_index.faiss")
+# INDEX_PATH = os.getenv("ZOMATO_INDEX_PATH", "zomato_index.faiss")
+INDEX_PATH = os.getenv("ZOMATO_INDEX_PATH", "zomato_hnsw_index")
 
 # FastAPI app
 app = FastAPI()
@@ -40,8 +42,7 @@ async def read_index():
     return FileResponse("static/index.html")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ElevenLabs client
-el_client = ElevenLabs(api_key=ELEVEN_KEY) if ELEVEN_KEY else None
+tts_client = TTSClient(api_key=ELEVEN_KEY, voice_id=VOICE_ID)
 
 # RAG engine
 rag_engine = RAGEngine(
@@ -52,7 +53,8 @@ rag_engine = RAGEngine(
 if not exists(INDEX_PATH):
     rag_engine.build_index()
 else:
-    rag_engine.load_index()
+    # rag_engine.load_index()
+    rag_engine.load_index(f"{INDEX_PATH}/hnsw_index.bin", f"{INDEX_PATH}/id2text.pkl", f"{INDEX_PATH}/meta.pkl")
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -60,57 +62,52 @@ async def websocket_endpoint(ws: WebSocket):
     chosen_language = ws.query_params.get("lang", "en-IN")
     print(f"[Server] Starting STT with language = {chosen_language}")
     chosen_lang_el = "en" if chosen_language=="en-IN" else "hi"
+    user_phone = "6306061252"
+    llm = LLMClient(OPENAI_KEY, rag_engine, customer_phone=user_phone)
 
-    llm = LLMClient(OPENAI_KEY, rag_engine)
-    llm.reset()
-
-    # Stability heuristic state
+    transcripts: List[str] = []
     last_interim: str = ""
     last_interim_ts: float = 0.0
     spec_launched: bool = False
     last_user_end_ts: Optional[float] = None
+    # idle_task: Optional[asyncio.Task] = None
+    current_speech_tasks: set[asyncio.Task] = set()
 
-    # Helper: speak a sentence chunk concurrently
+    # def schedule_idle():
+    #     nonlocal idle_task
+    #     # cancelling any old one
+    #     if idle_task:
+    #         idle_task.cancel()
+
+    #     idle_task = asyncio.create_task(idle_watcher())
+        # print("idle_task done")
+
     async def speak_sentence(sentence: str):
-        if not el_client:
+        # Helper: speak a sentence chunk using TTSClient
+        # nonlocal idle_task
+        if not tts_client:
             return
-        first = True
-        t0 = None
-        try:
-            audio_iter = await asyncio.to_thread(
-                el_client.text_to_speech.stream,
-                text=sentence,
-                voice_id=VOICE_ID,
-                model_id="eleven_flash_v2_5",
-                optimize_streaming_latency=3,
-                language_code=chosen_lang_el,
-                output_format="pcm_44100",
-            )
-        except Exception as e:
-            print(f"[Server] TTS error: {e}")
-            return
+        # Cancel any existing idle watcher
+        # if idle_task:
+        #     idle_task.cancel()
+        #     idle_task = None
+        # Delegate to TTSClient for streaming and WebSocket forwarding
+        await tts_client.speak_sentence(
+            sentence=sentence,
+            ws=ws,
+            chosen_lang_el=chosen_lang_el,
+            last_user_end_ts=last_user_end_ts,
+        )
 
-        first = True
-        for pcm_chunk in audio_iter:
-            if not pcm_chunk:
-                continue
-            if first:
-                t0 = time.perf_counter()
-                print(last_user_end_ts)
-                if last_user_end_ts is not None:
-                    latency = t0 - last_user_end_ts
-                    print(f"[LATENCY] User→TTS startup: {latency:.3f} sec")
-                print(f"[{t0:.3f}] ← first TTS chunk for '{sentence[:30]}...'" )
-                first = False
-            await ws.send_bytes(pcm_chunk)
-        if t0:
-            print(f"[TIMING] TTS for sentence took {time.perf_counter()-t0:.3f} sec")
+    # async def idle_watcher():
+    #     try:
+    #         await asyncio.sleep(5.0)
+    #         asyncio.create_task(speak_sentence("क्या आप अभी भी वहाँ हैं?" if chosen_lang_el=="hi"
+    #                             else "Hi, are you still there?"))
 
-    async def keep_silence(ws, frame_size=1600, interval=0.2):
-        silence = b"\x00" * frame_size
-        while True:
-            await ws.send_bytes(silence)
-            await asyncio.sleep(interval)
+    #     except asyncio.CancelledError:
+    #         # user spoke or agent spoke again—just exit
+    #         return
 
     async def launch_llm(text: str):
         nonlocal spec_launched, last_interim
@@ -132,14 +129,20 @@ async def websocket_endpoint(ws: WebSocket):
                 response_buffer += token
                 # flush each complete sentence immediately
                 while True:
-                    m = re.search(r"([\.\!,?])(\s|$)", response_buffer)
+                    m = re.search(r"([\.\!,?|])(\s|$)", response_buffer)
                     if not m:
                         break
                     end = m.end()
                     sentence = response_buffer[:end].strip()
                     print(f"[{time.perf_counter():.3f}] [Buffer] flush: '{sentence}'")
-                    asyncio.create_task(speak_sentence(sentence))
-                    await asyncio.sleep(1)
+                    task = asyncio.create_task(speak_sentence(sentence))
+                    current_speech_tasks.add(task)
+                    task.add_done_callback(lambda fut: current_speech_tasks.discard(fut))
+                    # task.add_done_callback(lambda fut: schedule_idle())
+
+                    # asyncio.create_task(speak_sentence(sentence))
+                    await asyncio.sleep(0.1)
+                    transcripts.append(response_buffer)
                     response_buffer = response_buffer[end:]
 
             if last_token_ts:
@@ -147,8 +150,8 @@ async def websocket_endpoint(ws: WebSocket):
             if response_buffer.strip():
                 final_sent = response_buffer.strip()
                 print(f"[{time.perf_counter():.3f}] [Buffer] final flush: '{final_sent}'")
-                asyncio.create_task(speak_sentence(final_sent))
-
+                speak_task = asyncio.create_task(speak_sentence(final_sent))
+                # speak_task.add_done_callback(lambda fut: schedule_idle())
             await ws.send_json({"type": "response_end"})
         finally:
             t_llm_end = time.perf_counter()
@@ -158,31 +161,58 @@ async def websocket_endpoint(ws: WebSocket):
 
     async def on_transcript(text: str, is_final: bool):
         nonlocal last_interim, last_interim_ts, spec_launched, last_user_end_ts
+        # if idle_task:
+        #     idle_task.cancel()
+        #     idle_task = None
+        spec_launched=False
         await ws.send_json({"type": "transcript", "text": text, "final": is_final})
+        # record for end‑of‑call summary
+        transcripts.append(text)
         now = time.perf_counter()
 
         if not is_final:
+            # If the interim has >2 words, we stop speaking and start a confirmation timer
+            if len(text.split()) >= 1 and not spec_launched:
+                # Cancel any in‑flight speech
+                await ws.send_json({"type": "stop_speech"})
+                spec_launched=True
             if len(text.split()) >= 3:
                 if text == last_interim and (now - last_interim_ts) >= 0.15 and not spec_launched:
                     spec_launched = True
+                    for t in list(current_speech_tasks):
+                        if not t.done():
+                            t.cancel()
+                    current_speech_tasks.clear()
                     last_user_end_ts = now
                     print(f"[{now:.3f}] [STT] stable interim: '{text}'")
-                    asyncio.create_task(launch_llm(text))
+                    await ws.send_json({"type": "stop_speech"})
+                    # asyncio.create_task(launch_llm(text))
+                    current_tts_task = asyncio.create_task(launch_llm(text))
                 elif text != last_interim:
                     last_interim = text
                     last_interim_ts = now
             return
         last_user_end_ts = now
+
         if not spec_launched:
             spec_launched = True
+            for t in list(current_speech_tasks):
+                if not t.done():
+                    t.cancel()
+            current_speech_tasks.clear()
             print(f"[{now:.3f}] [STT] final transcript kickoff: '{text}'")
-            asyncio.create_task(launch_llm(text))
+            await ws.send_json({"type": "stop_speech"})
+            current_tts_task = asyncio.create_task(launch_llm(text))
+        
+        if spec_launched:
+            spec_launched = False
+            return
 
     # Start STT
     stt = DeepgramTranscriber(DG_KEY, use_mic=False, language=chosen_language)
     llm.reset()
     # initial greeting
-    lang = "Hindi" if chosen_language == "multi" else "English"
+    lang = "English" if chosen_language == "en-IN" else "Hindi"
     asyncio.create_task(on_transcript(f"greet in {lang}", True))
     threading.Thread(target=lambda: asyncio.run(stt.start(on_transcript)), daemon=True).start()
 
@@ -194,5 +224,17 @@ async def websocket_endpoint(ws: WebSocket):
             elif msg.get("type") == "websocket.disconnect":
                 break
     finally:
+        # end of call → generate and persist a session summary
+        full = "\n".join(transcripts)
+        try:
+            summary = await llm.summarize_session(full)
+            rag_engine.add_memory(user_phone, summary)
+            print(f"[MEMORY] saved summary: {user_phone}:\n{summary}")
+        except Exception as e:
+            print(f"[MEMORY] summary error: {e}")
+        # teardown
         stt.finish()
-        await ws.close()
+        try:
+            await ws.close()
+        except RuntimeError:
+            pass

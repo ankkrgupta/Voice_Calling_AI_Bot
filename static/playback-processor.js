@@ -21,12 +21,25 @@ class PlaybackProcessor extends AudioWorkletProcessor {
 
     // When main thread posts a Float32Array chunk, append it:
     this.port.onmessage = (event) => {
-      const incoming = event.data;
-      if (incoming instanceof Float32Array) {
-        // Append to our internal queue
-        const newBuf = new Float32Array(this._buffer.length + incoming.length);
+      // const incoming = event.data;
+      // if (incoming instanceof Float32Array) {
+      //   // Append to our internal queue
+      //   const newBuf = new Float32Array(this._buffer.length + incoming.length);
+      //   newBuf.set(this._buffer, 0);
+      //   newBuf.set(incoming, this._buffer.length);
+      //   this._buffer = newBuf;
+      // }
+      const data = event.data;
+      if (data.command === "flush") {
+        // drop all queued samples immediately
+        this._buffer = new Float32Array(0);
+        return;
+      }
+      // otherwise incoming is Float32Array
+      if (data instanceof Float32Array) {
+        const newBuf = new Float32Array(this._buffer.length + data.length);
         newBuf.set(this._buffer, 0);
-        newBuf.set(incoming, this._buffer.length);
+        newBuf.set(data, this._buffer.length);
         this._buffer = newBuf;
       }
     };
