@@ -1,4 +1,4 @@
-# Voice Calling AI Agent (Deepgram -> GPT-4o-Mini -> Elevenlabs)
+# Voice Calling AI Agent (Deepgram -> gpt-3.5-turbo-1106 -> Elevenlabs)
 
 ## Setup Instructions
 
