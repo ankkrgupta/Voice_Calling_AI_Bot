@@ -18,6 +18,8 @@ from typing import List, Optional
 
 from rag_module_integration import RAGEngine
 import json
+import uuid
+import httpx
 
 # Environment setup
 load_dotenv()
@@ -63,14 +65,69 @@ if not (exists(idx_file) and exists(data_file) and exists(meta_file)):
 else:
     rag_engine.load_index(idx_file, data_file, meta_file)
 
+# After environment setup, add webhook URL envs
+CREDITS_API_BASE_URL = os.getenv("CREDITS_API_BASE_URL")
+SESSION_ENDPOINT = f"{CREDITS_API_BASE_URL}/v1/voice-calls/session"
+WEBHOOK_ENDPOINT = f"{CREDITS_API_BASE_URL}/v1/voice-calls/webhook"
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     chosen_language = ws.query_params.get("lang", "en-IN")
+    auth_token = ws.query_params.get("token")
+    if not auth_token:
+        # Close with policy violation (1008)
+        await ws.close(code=1008, reason="Auth token required")
+        return
+
+    # ─── Create unique session id and notify credits API ────────────────
+    session_id = str(uuid.uuid4())
+    user_id: Optional[str] = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                SESSION_ENDPOINT,
+                json={"sessionId": session_id},
+                headers={"Authorization": f"Bearer {auth_token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Attempt to capture user identifier from response if provided
+            session_data = data.get("session") or data.get("data") or {}
+            user_id = session_data.get("user") or session_data.get("userId")
+    except Exception as e:
+        print(f"[SessionInit] error contacting {SESSION_ENDPOINT}: {e}")
+        await ws.close(code=1011, reason="Session init failed")
+        return
+
     print(f"[Server] Starting STT with language = {chosen_language}")
     chosen_lang_el = "en" if chosen_language=="en-IN" else "hi"
     user_phone = "6306061252"
     llm = LLMClient(GROQ_KEY, OPENAI_KEY, rag_engine, customer_phone=user_phone)
+
+    # ─── Background task: ping webhook every minute ─────────────────────
+    async def credit_deduction_task(stop_event: asyncio.Event):
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while not stop_event.is_set():
+                # Sleep for 60 seconds but wake up early if stop_event is set
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    pass  # expected after 60 s
+                if stop_event.is_set():
+                    break
+                payload = {"minutes": 1, "callId": session_id}
+                if user_id:
+                    payload["userId"] = user_id
+                try:
+                    resp = await client.post(WEBHOOK_ENDPOINT, json=payload)
+                    resp.raise_for_status()
+                    print(f"[Webhook] credit deduction OK – {payload}")
+                except Exception as e:
+                    print(f"[Webhook] error: {e}")
+
+    stop_event = asyncio.Event()
+    webhook_task = asyncio.create_task(credit_deduction_task(stop_event))
 
     transcripts: List[str] = []
     last_interim: str = ""
@@ -232,6 +289,14 @@ async def websocket_endpoint(ws: WebSocket):
                 break
     finally:
         # end of call → generate and persist a session summary
+        # stop webhook task
+        stop_event.set()
+        webhook_task.cancel()
+        try:
+            await webhook_task
+        except asyncio.CancelledError:
+            pass
+
         full = "\n".join(transcripts)
         try:
             summary = await llm.summarize_session(full)

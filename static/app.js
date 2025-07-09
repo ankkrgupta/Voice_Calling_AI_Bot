@@ -1,5 +1,5 @@
 // ───────────────────────────────────────────────────────────────────────────────
-//                                   app.js                                  
+//                                   app.js
 // ───────────────────────────────────────────────────────────────────────────────
 //
 // Using an AudioWorkletNode for TTS playback and a ScriptProcessorNode for mic capture.
@@ -15,68 +15,97 @@ let scriptNodeSender = null;
 let micStream = null;
 let ws = null;
 
-let float32Queue = [];                // FIFO of Float32 mic samples
+let float32Queue = []; // FIFO of Float32 mic samples
 const TARGET_SAMPLE_RATE = 16000;
-const TTS_SAMPLE_RATE    = 44100;
+const TTS_SAMPLE_RATE = 44100;
 let micSampleRate = null;
 
 let playbackEndTime = 0;
 let playbackRate = null;
-let selectedLanguage = "en-IN";       // default lang
+let selectedLanguage = 'en-IN'; // default lang
 
-window.addEventListener("load", () => {
+let authToken = localStorage.getItem('authToken');
+
+window.addEventListener('load', () => {
   // Language buttons
-  document.querySelectorAll(".langBtn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".langBtn").forEach(b => b.classList.remove("selected"));
-      btn.classList.add("selected");
+  document.querySelectorAll('.langBtn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document
+        .querySelectorAll('.langBtn')
+        .forEach((b) => b.classList.remove('selected'));
+      btn.classList.add('selected');
       selectedLanguage = btn.dataset.lang;
       console.log(`[UI] Selected language = ${selectedLanguage}`);
     });
   });
 
+  if (!authToken) {
+    authToken = prompt('Enter authentication token');
+    if (authToken) {
+      localStorage.setItem('authToken', authToken);
+    } else {
+      alert('Authentication token is required to start a conversation.');
+    }
+  }
+
   // Start/Stop button
-  const startStopBtn = document.getElementById("startStopBtn");
+  const startStopBtn = document.getElementById('startStopBtn');
   let streaming = false;
 
-  startStopBtn.addEventListener("click", async () => {
+  startStopBtn.addEventListener('click', async () => {
     if (!streaming) {
+      // Ensure auth token exists before initiating streaming
+      if (!authToken) {
+        authToken = prompt('Enter authentication token');
+        if (authToken) {
+          localStorage.setItem('authToken', authToken);
+        } else {
+          alert('Authentication token is required to start a conversation.');
+          return; // abort start
+        }
+      }
       // ─── USER CLICKED “START” ───────────────────────────────────────
       streaming = true;
-      startStopBtn.textContent = "Stop the Conversation";
-      startStopBtn.classList.add("stop");
-      document.getElementById("info").textContent =
-        selectedLanguage === "en-IN"
-          ? "Current language of conversation is English. " + "If you want to shift to Hindi, select it above, then stop the ongoing conversation and click on start conversation button again."
-          : "Current language of conversation is Hindi. " + "If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.";
+      startStopBtn.textContent = 'Stop the Conversation';
+      startStopBtn.classList.add('stop');
+      document.getElementById('info').textContent =
+        selectedLanguage === 'en-IN'
+          ? 'Current language of conversation is English. ' +
+            'If you want to shift to Hindi, select it above, then stop the ongoing conversation and click on start conversation button again.'
+          : 'Current language of conversation is Hindi. ' +
+            'If you want to shift to English, select it above, then stop the ongoing conversation and click on start conversation button again.';
 
       // 1) Create & resume playback AudioContext
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       await audioContext.resume();
       playbackRate = audioContext.sampleRate;
-      console.log("[AUDIO] Playback resumed, rate =", playbackRate);
+      console.log('[AUDIO] Playback resumed, rate =', playbackRate);
 
       // 2) Load & instantiate the AudioWorklet for TTS playback
-      await audioContext.audioWorklet.addModule("/static/playback-processor.js");
-      playProcessorNode = new AudioWorkletNode(audioContext, "playback-processor");
+      await audioContext.audioWorklet.addModule(
+        '/static/playback-processor.js'
+      );
+      playProcessorNode = new AudioWorkletNode(
+        audioContext,
+        'playback-processor'
+      );
       playProcessorNode.connect(audioContext.destination);
-      console.log("[AUDIO] Worklet loaded & connected");
+      console.log('[AUDIO] Worklet loaded & connected');
 
       // 3) Create & resume capture AudioContext
       captureCtx = new (window.AudioContext || window.webkitAudioContext)();
       await captureCtx.resume();
       micSampleRate = captureCtx.sampleRate;
-      console.log("[AUDIO] Capture resumed, rate =", micSampleRate);
+      console.log('[AUDIO] Capture resumed, rate =', micSampleRate);
 
       // 4) Kick off WebSocket + mic capture
       await startStreaming();
-
     } else {
       // ─── USER CLICKED “STOP” ────────────────────────────────────────
       streaming = false;
-      startStopBtn.textContent = "Start the Conversation";
-      startStopBtn.classList.remove("stop");
-      document.getElementById("info").textContent = "";
+      startStopBtn.textContent = 'Start the Conversation';
+      startStopBtn.classList.remove('stop');
+      document.getElementById('info').textContent = '';
 
       // Tear down mic
       if (scriptNodeSender) {
@@ -85,7 +114,7 @@ window.addEventListener("load", () => {
         scriptNodeSender = null;
       }
       if (micStream) {
-        micStream.getTracks().forEach(t => t.stop());
+        micStream.getTracks().forEach((t) => t.stop());
         micStream = null;
       }
       float32Queue = [];
@@ -117,7 +146,8 @@ function downsampleBuffer(buffer, srcRate) {
   for (let i = 0; i < newLength; i++) {
     const start = Math.floor(i * ratio);
     const end = Math.min(buffer.length, Math.floor((i + 1) * ratio));
-    let sum = 0, count = 0;
+    let sum = 0,
+      count = 0;
     for (let j = start; j < end; j++) {
       sum += buffer[j];
       count++;
@@ -132,7 +162,9 @@ function resampleTTSToPlayback(bufferTTS) {
   if (playbackRate === TTS_SAMPLE_RATE) {
     return bufferTTS.slice(); // shallow copy if no resampling needed
   }
-  const targetLen = Math.round((bufferTTS.length * playbackRate) / TTS_SAMPLE_RATE);
+  const targetLen = Math.round(
+    (bufferTTS.length * playbackRate) / TTS_SAMPLE_RATE
+  );
   const result = new Float32Array(targetLen);
   const ratio = TTS_SAMPLE_RATE / playbackRate;
   for (let i = 0; i < targetLen; i++) {
@@ -158,7 +190,10 @@ function floatToInt16(floatBuffer) {
 // ─── When we receive an Int16@TTS SAMPLE RATE, TTS chunk, convert, resample, and send ──────────
 function handleBinaryFrame(arrayBuffer) {
   // 1) Read raw 16-bit PCM @ TTS SAMPLE RATE
-  console.log("[Client] 🔊 Received TTS chunk, byteLength =", arrayBuffer.byteLength);
+  console.log(
+    '[Client] 🔊 Received TTS chunk, byteLength =',
+    arrayBuffer.byteLength
+  );
 
   const pcm16 = new Int16Array(arrayBuffer);
   if (!pcm16.length) return;
@@ -183,29 +218,37 @@ function handleBinaryFrame(arrayBuffer) {
   // 4) Recompute playbackEndTime:
   //    We assume “toSend.length” samples will be drained in real time at playbackRate.
   const now = audioContext.currentTime;
-  playbackEndTime = now + (toSend.length / playbackRate);
+  playbackEndTime = now + toSend.length / playbackRate;
 
   console.log(
-    "[DEBUG] TTS chunk arrived (orig", pcm16.length, "samples → resampled",
-    toSend.length, "samples). Approx unmute at", playbackEndTime.toFixed(3)
+    '[DEBUG] TTS chunk arrived (orig',
+    pcm16.length,
+    'samples → resampled',
+    toSend.length,
+    'samples). Approx unmute at',
+    playbackEndTime.toFixed(3)
   );
 }
 
 // ─── Build WebSocket and attach handlers ───────────────────────────────────────
 function setupWebSocket() {
   // Include chosenLanguage as a query parameter
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = `${protocol}://${window.location.host}/ws?lang=${encodeURIComponent(selectedLanguage)}`;
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${protocol}://${
+    window.location.host
+  }/ws?lang=${encodeURIComponent(selectedLanguage)}&token=${encodeURIComponent(
+    authToken
+  )}`;
   ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
+  ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    console.log("[WS] Connection opened");
+    console.log('[WS] Connection opened');
     console.log(`[UI] WS opened with ?lang=${selectedLanguage}`);
   };
 
-  ws.onerror = (err) => console.error("[WS] Error:", err);
-  ws.onclose = () => console.log("[WS] Connection closed");
+  ws.onerror = (err) => console.error('[WS] Error:', err);
+  ws.onclose = () => console.log('[WS] Connection closed');
 
   ws.onmessage = (evt) => {
     // if (evt.data instanceof ArrayBuffer) {
@@ -249,26 +292,26 @@ function setupWebSocket() {
     try {
       msg = JSON.parse(evt.data);
     } catch {
-      console.warn("[WS] Non-JSON message:", evt.data);
+      console.warn('[WS] Non-JSON message:', evt.data);
       return;
     }
 
-    if (msg.type === "stop_speech") {
+    if (msg.type === 'stop_speech') {
       // Flush worklet buffer immediately
-      playProcessorNode.port.postMessage({ command: "flush" });
+      playProcessorNode.port.postMessage({ command: 'flush' });
       // Allow mic capture right away
       playbackEndTime = 0;
-      console.log("[Client] Received stop_speech → flushing audio");
+      console.log('[Client] Received stop_speech → flushing audio');
       return;
     }
 
-    if (msg.type === "transcript") {
-      const label = msg.final ? "FINAL" : "INTERIM";
-      document.getElementById("transcripts").textContent +=
-        `\nTRANSCRIPT [${label}]: ${msg.text}\n`;
-    }
-    else if (msg.type === "token") {
-      document.getElementById("transcripts").textContent += msg.token;
+    if (msg.type === 'transcript') {
+      const label = msg.final ? 'FINAL' : 'INTERIM';
+      document.getElementById(
+        'transcripts'
+      ).textContent += `\nTRANSCRIPT [${label}]: ${msg.text}\n`;
+    } else if (msg.type === 'token') {
+      document.getElementById('transcripts').textContent += msg.token;
     }
   };
 
@@ -319,22 +362,24 @@ function startMicStreaming(ws) {
     }
 
     // Keep leftover for next round
-    const leftoverIn = Math.round((down16k.length - i) * (micSampleRate / TARGET_SAMPLE_RATE));
+    const leftoverIn = Math.round(
+      (down16k.length - i) * (micSampleRate / TARGET_SAMPLE_RATE)
+    );
     const leftover = merged.subarray(merged.length - leftoverIn);
     float32Queue = leftoverIn > 0 ? [leftover] : [];
   };
 
   // Connect to destination so the node stays alive (no output)
   scriptNodeSender.connect(audioContext.destination);
-  console.log("[MIC] Mic streaming started");
+  console.log('[MIC] Mic streaming started');
 }
 
 // ─── Start everything when user clicks “Start” ─────────────────────────────────
 async function startStreaming() {
   // 1) Resume AudioContext if needed
-  if (audioContext.state === "suspended") {
+  if (audioContext.state === 'suspended') {
     await audioContext.resume();
-    console.log("[DEBUG] audioContext resumed; state =", audioContext.state);
+    console.log('[DEBUG] audioContext resumed; state =', audioContext.state);
   }
 
   // 2) Request microphone
@@ -343,9 +388,9 @@ async function startStreaming() {
       audio: { echoCancellation: true, noiseSuppression: true },
     });
     micSampleRate = captureCtx.sampleRate;
-    console.log("[DEBUG] Mic sampleRate =", micSampleRate);
+    console.log('[DEBUG] Mic sampleRate =', micSampleRate);
   } catch (err) {
-    console.error("[UI] getUserMedia error:", err);
+    console.error('[UI] getUserMedia error:', err);
     return;
   }
 
@@ -353,8 +398,8 @@ async function startStreaming() {
   const socket = setupWebSocket();
 
   // 4) Once WS is open, start mic streaming
-  socket.addEventListener("open", () => {
-    console.log("[WS] Ready → starting mic streaming");
+  socket.addEventListener('open', () => {
+    console.log('[WS] Ready → starting mic streaming');
     startMicStreaming(socket);
   });
-} 
+}
