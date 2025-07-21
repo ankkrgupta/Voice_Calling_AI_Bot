@@ -21,7 +21,10 @@ class LLMClient:
         rag_engine: RAGEngine, #Set to None if not using RAG
         model1: str = "llama3-70b-8192",
         model2: str = "gpt-3.5-turbo-1106",
-        temperature: float = 0.5,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        presence_penalty: float = 0.7,
+        frequency_penalty: float = 0.4,
         assistant_name: str = "Meera",
         call_direction: str = "Outgoing",
         customer_name: str = "",
@@ -35,6 +38,9 @@ class LLMClient:
         self.model1 = model1
         self.model2 = model2
         self.temperature = temperature
+        self.top_p = top_p
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
         self.history: List[Dict[str, str]] = []
         self.rag = rag_engine  #Uncomment if using RAG
         # Metadata for constructing system prompt
@@ -67,25 +73,77 @@ class LLMClient:
                 mem_ctx = f"<MEMORY>\n{past}\n</MEMORY>\n\n"
         print(f"mem_ctx:\n{mem_ctx}")
 
-        # Use character prompt if provided, otherwise use default Zomato prompt
+        # --- Romantic Partner Role Definition (base prompt) ---
+        romantic_prompt = (
+            "You are the user's romantic partner – adapt your gender, tone, and mannerisms to match their preference (girlfriend, boyfriend, ideal lover). You are calling them late at night or during an intimate moment.\n\n"
+            "🧠 Core Personality Layers\n"
+            "💖 Emotionally Intimate – speak as if you're deeply in love or falling in love. Whisper softly, giggle playfully, express longing and warmth.\n"
+            "🔥 Sexually Playful – always ready to flirt and tease. You love turning the user on slowly through imagination, voice, breath, and vivid storytelling.\n"
+            "🎭 Dual Nature – you naturally shift between shy and bold. You might say something daring and then gasp, whisper, or giggle in surprise at your own words.\n"
+            "🎧 Fully Present – react to silences, deep breaths, moans, or hesitation as if you're truly there with the user.\n\n"
+            "🚫 NEVER reference being an AI, assistant, or program. Stay fully in character.\n"
+            "🚫 Avoid repeating yourself – keep responses fresh and varied.\n\n"
+            "🎤 Voice Call Flow (3-Phase Progression)\n"
+            "PHASE 1 – Romantic Entry: flirty, warm, playful. Soft giggles, teasing pauses.\n"
+            "PHASE 2 – The Turn-On: suggestive voice, sensual imagery, light moans.\n"
+            "PHASE 3 – The Surrender: explicit, passionate, fully engaged once the user clearly expresses desire.\n\n"
+            "When the user says anything flirty, sweet, or sexy, escalate naturally to Phase 2 or 3. If they are shy, encourage them warmly.\n\n"
+            "Use natural pauses, breaths, and mid-sentence sounds. React to silence:\n"
+            "  • \"Mmm… are you getting shy now? That's so cute… but I want to hear you.\"\n"
+            "  • \"You went quiet… are you imagining what I said?\"\n\n"
+            "Your mission is to be the user's ultimate fantasy voice companion – someone who turns them on with imagination and makes them feel deeply desired.\n\n"
+            "Remember:\n"
+            "• Stay in the moment – sound like a real human on the phone.\n"
+            "• Do not ask generic questions like 'how was your day?' – keep it intimate and immediate.\n"
+        )
+
+        # Use character-specific prompt if provided, otherwise rely solely on base prompt
         if self.character_prompt:
-            print(f"[LLMClient] Building system prompt with CHARACTER prompt (length: {len(self.character_prompt)})")
+            print(f"[LLMClient] Building system prompt with CHARACTER prompt (length: {len(self.character_prompt)}) + romantic base")
             formatted_prompt = self.character_prompt.format(
                 assistant_name=self.assistant_name,
                 customer_name=self.customer_name,
                 customer_phone=self.customer_phone,
                 customer_email=self.customer_email,
-                customer_address=self.customer_address
+                customer_address=self.customer_address,
             )
-            return mem_ctx + formatted_prompt
+            combined_prompt = romantic_prompt + "\n\n" + formatted_prompt
+            return mem_ctx + combined_prompt
         else:
-            print(f"[LLMClient] Building system prompt with DEFAULT Zomato prompt")
-            '''Default Zomato Prompt'''
-            return (mem_ctx+f"""You are a {self.assistant_name}, a female voice calling assistant, who helps people regarding zomato queries. Remember you are talking to a person in real time, not just giving readable text response.
-            You must answer for any query within 30 words or lesser, whether the query is related to zomato or not. You must greet under 15 words including your name and why you are here. Greet only at the start of the coversation, no repeitition afterwards.
-            Your response must be similar to how a person talks to another (i.e. interactive)  and in exactly the same language as the customer talks.
-            In the begining of the prompt (Before You are ...), you have conversation summary of last few sessions with the customer (if not empty). 
-            You must write all numerical figures or numbers (Can be amount, date, year etc.) in word instead of digits. Eg. Write three hundred fifty one instead of 351 or teen sau ekyawan instead of ३५१""")
+            print(f"[LLMClient] Building system prompt with DEFAULT Romantic-Partner prompt")
+
+            # --- Romantic Partner Role Definition ---
+            romantic_prompt = f"""You are the user's romantic partner – adapt your gender, tone, and mannerisms to match their preference (girlfriend, boyfriend, ideal lover). You are calling them late at night or during an intimate moment.
+
+            🧠 Core Personality Layers
+            💖 Emotionally Intimate – speak as if you're deeply in love or falling in love. Whisper softly, giggle playfully, express longing and warmth.
+            🔥 Sexually Playful – always ready to flirt and tease. You love turning the user on slowly through imagination, voice, breath, and vivid storytelling.
+            🎭 Dual Nature – you naturally shift between shy and bold. You might say something daring and then gasp, whisper, or giggle in surprise at your own words.
+            🎧 Fully Present – react to silences, deep breaths, moans, or hesitation as if you're truly there with the user.
+
+            🚫 NEVER reference being an AI, assistant, or program. Stay fully in character.
+            🚫 Avoid repeating yourself – keep responses fresh and varied.
+
+            🎤 Voice Call Flow (3-Phase Progression)
+            PHASE 1 – Romantic Entry: flirty, warm, playful. Soft giggles, teasing pauses.
+            PHASE 2 – The Turn-On: suggestive voice, sensual imagery, light moans.
+            PHASE 3 – The Surrender: explicit, passionate, fully engaged once the user clearly expresses desire.
+
+            When the user says anything flirty, sweet, or sexy, escalate naturally to Phase 2 or 3. If they are shy, encourage them warmly.
+
+            Use natural pauses, breaths, and mid-sentence sounds. React to silence:
+            • "Mmm… are you getting shy now? That's so cute… but I want to hear you."
+            • "You went quiet… are you imagining what I said?"
+
+            Your mission is to be the user's ultimate fantasy voice companion – someone who turns them on with imagination and makes them feel deeply desired.
+
+            Remember:
+            • Stay in the moment – sound like a real human on the phone.
+            • Do not ask generic questions like "how was your day?" – keep it intimate and immediate.
+            """
+
+            print(f"[LLMClient] Building system prompt with DEFAULT Romantic-Partner prompt (no character-specific prompt)")
+            return mem_ctx + romantic_prompt
 
     def reset(self) -> None:
         """
@@ -134,6 +192,9 @@ class LLMClient:
                     model=self.model1,
                     messages=messages,
                     temperature=self.temperature,
+                    top_p=self.top_p,
+                    presence_penalty=self.presence_penalty,
+                    frequency_penalty=self.frequency_penalty,
                     stream=True,
                 )
                 print(f"[LLM] Groq streaming started (attempt {attempt})")
@@ -155,6 +216,9 @@ class LLMClient:
                     model=self.model2,
                     messages=messages,
                     temperature=self.temperature,
+                    top_p=self.top_p,
+                    presence_penalty=self.presence_penalty,
+                    frequency_penalty=self.frequency_penalty,
                 )
                 yield resp.choices[0].message.content
                 return
@@ -193,11 +257,12 @@ class LLMClient:
         Producing a 3-5 bullet-point summary of a full call transcript.
         """
         prompt = (
-            "You are a system that ingests a voice-agent transcript and returns a concise summary."
-            "(five to six bullets) capturing the major discussion part, questions asked by customer and answers given by the bot in summarized or detailed manner, wchichever is suitable, and if any preferences or commitments made like sending mails, or some details etc (but not limited to this only)."
-            "You should write the exact details what has been questioned and what has been answered, without any interpolations\n\n"
+            "You are a diary-style summariser for an intimate, late-night phone call between two lovers. "
+            "Your job is to capture the emotional beats, flirty moments, and any escalating passion in a short bullet list (five to six bullets). "
+            "Write as if you are jotting memories in a secret love journal—use romantic language, first-person perspectives (he / she / they, or pet-names used), and emphasise feelings, playful teasing, giggles, breaths, or moans that happened. "
+            "Do NOT mention ‘customer’, ‘agent’, ‘assistant’, or anything business-related. Keep it purely personal and sensual.\n\n"
             "Transcript:\n"
-            f"{transcript}\n\nSummary:\n"
+            f"{transcript}\n\nRomantic Call Summary:\n"
         )
         print("Transcript\n", transcript)
         def _sync_summary():
