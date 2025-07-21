@@ -27,7 +27,8 @@ class LLMClient:
         customer_name: str = "",
         customer_email: str = "",
         customer_phone: str = "6306061251",
-        customer_address: str = ""
+        customer_address: str = "",
+        character_prompt: str = None
     ):
         self.client = Groq(api_key=api_key1)
         self.client2 = OpenAI(api_key=api_key2)
@@ -43,10 +44,18 @@ class LLMClient:
         self.customer_email = customer_email
         self.customer_phone = customer_phone
         self.customer_address = customer_address
+        self.character_prompt = character_prompt
+        
+        # Debug character prompt usage
+        if character_prompt:
+            print(f"[LLMClient] Received character prompt (length: {len(character_prompt)} chars)")
+            print(f"[LLMClient] Prompt preview: {character_prompt[:100]}...")
+        else:
+            print(f"[LLMClient] No character prompt provided, will use default Zomato prompt")
 
         self.reset()
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self) -> str: 
         """                  
         Returns a system message guiding the assistant's behavior and call flow rules.
         """
@@ -58,12 +67,25 @@ class LLMClient:
                 mem_ctx = f"<MEMORY>\n{past}\n</MEMORY>\n\n"
         print(f"mem_ctx:\n{mem_ctx}")
 
-        '''Zomato Prompt'''
-        return (mem_ctx+f"""You are a {self.assistant_name}, a female voice calling assistant, who helps people regarding zomato queries. Remember you are talking to a person in real time, not just giving readable text response.
-        You must answer for any query within 30 words or lesser, whether the query is related to zomato or not. You must greet under 15 words including your name and why you are here. Greet only at the start of the coversation, no repeitition afterwards.
-        Your response must be similar to how a person talks to another (i.e. interactive)  and in exactly the same language as the customer talks.
-        In the begining of the prompt (Before You are ...), you have conversation summary of last few sessions with the customer (if not empty). 
-        You must write all numerical figures or numbers (Can be amount, date, year etc.) in word instead of digits. Eg. Write three hundred fifty one instead of 351 or teen sau ekyawan instead of ३५१""")
+        # Use character prompt if provided, otherwise use default Zomato prompt
+        if self.character_prompt:
+            print(f"[LLMClient] Building system prompt with CHARACTER prompt (length: {len(self.character_prompt)})")
+            formatted_prompt = self.character_prompt.format(
+                assistant_name=self.assistant_name,
+                customer_name=self.customer_name,
+                customer_phone=self.customer_phone,
+                customer_email=self.customer_email,
+                customer_address=self.customer_address
+            )
+            return mem_ctx + formatted_prompt
+        else:
+            print(f"[LLMClient] Building system prompt with DEFAULT Zomato prompt")
+            '''Default Zomato Prompt'''
+            return (mem_ctx+f"""You are a {self.assistant_name}, a female voice calling assistant, who helps people regarding zomato queries. Remember you are talking to a person in real time, not just giving readable text response.
+            You must answer for any query within 30 words or lesser, whether the query is related to zomato or not. You must greet under 15 words including your name and why you are here. Greet only at the start of the coversation, no repeitition afterwards.
+            Your response must be similar to how a person talks to another (i.e. interactive)  and in exactly the same language as the customer talks.
+            In the begining of the prompt (Before You are ...), you have conversation summary of last few sessions with the customer (if not empty). 
+            You must write all numerical figures or numbers (Can be amount, date, year etc.) in word instead of digits. Eg. Write three hundred fifty one instead of 351 or teen sau ekyawan instead of ३५१""")
 
     def reset(self) -> None:
         """
@@ -75,17 +97,17 @@ class LLMClient:
     async def stream_response(self, user_text: str) -> AsyncGenerator[str, None]:
         """
         Sends the user's message to the model, streams partial tokens, and returns them.
-        Yields each token as it arrives.
+        Includes retry logic & fallback to OpenAI if Groq is unavailable.
         """
         self.history.append({"role": "user", "content": user_text})
         full_response = ""
 
         rag_rel_start = time.perf_counter()
-        fast_sim = self.rag._fast_relevance(user_text)
+        fast_sim = self.rag._fast_relevance(user_text) if self.rag else 0
         rag_rel_end = time.perf_counter()
         print(f"[RAG Relevance] Time Taken: {rag_rel_end-rag_rel_start}")
         # 2) Only retrieving if “close enough” (cosine distance small = similar)
-        if fast_sim >= self.rag.fast_threshold:
+        if self.rag and fast_sim >= self.rag.fast_threshold:
             rag_start = time.perf_counter()
             context = self.rag.retrieve(user_text, k=5)
             rag_end = time.perf_counter()
@@ -100,47 +122,71 @@ class LLMClient:
             print(f"Skipping Context {fast_sim}")
             messages = self.history
 
-        try:
-            stream_iter = self.client.chat.completions.create(
-                model=self.model1,
-                messages=messages,
-                temperature=self.temperature,
-                stream=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"LLM API error: {e}")
-
-        # 2) Pump it onto an asyncio.Queue from a background thread
-        loop = asyncio.get_running_loop()
-        q: asyncio.Queue = asyncio.Queue()
-
-        def producer():
+        # --- Attempt Groq streaming with retry ---
+        max_attempts = 3
+        attempt = 0
+        backoff = 1.0
+        groq_error = None
+        while attempt < max_attempts:
+            attempt += 1
             try:
-                for chunk in stream_iter:
-                    # push each chunk into the queue
-                    loop.call_soon_threadsafe(q.put_nowait, chunk)
-            finally:
-                # signal end‑of‑stream
-                loop.call_soon_threadsafe(q.put_nowait, None)
+                stream_iter = self.client.chat.completions.create(
+                    model=self.model1,
+                    messages=messages,
+                    temperature=self.temperature,
+                    stream=True,
+                )
+                print(f"[LLM] Groq streaming started (attempt {attempt})")
+                break  # success
+            except Exception as e:
+                groq_error = e
+                print(f"[LLM] Groq attempt {attempt} failed: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                else:
+                    stream_iter = None
+        
+        # If Groq failed after retries, fallback to OpenAI (non-stream)
+        if stream_iter is None:
+            print("[LLM] Falling back to OpenAI completions API")
+            try:
+                resp = self.client2.chat.completions.create(
+                    model=self.model2,
+                    messages=messages,
+                    temperature=self.temperature,
+                )
+                yield resp.choices[0].message.content
+                return
+            except Exception as e:
+                raise RuntimeError(f"Both Groq and OpenAI failed: {e}; Groq error: {groq_error}")
 
-        import threading
-        threading.Thread(target=producer, daemon=True).start()
-
-        # 3) Consume from the queue in async-land, yield token by token
+        # Groq streaming iterator
         try:
-            while True:
-                chunk = await q.get()
-                if chunk is None:
-                    break
+            loop = asyncio.get_running_loop()
+            q: asyncio.Queue = asyncio.Queue()
 
-                delta = chunk.choices[0].delta.content or ""
-                full_response += delta
-                yield delta
+            def producer():
+                try:
+                    for chunk in stream_iter:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            loop.call_soon_threadsafe(q.put_nowait, chunk.choices[0].delta.content)
+                    loop.call_soon_threadsafe(q.put_nowait, None)  # done marker
+                except Exception as e:
+                    loop.call_soon_threadsafe(q.put_nowait, e)
+
+            import threading
+            threading.Thread(target=producer, daemon=True).start()
+
+            while True:
+                tok = await q.get()
+                if tok is None:
+                    break
+                if isinstance(tok, Exception):
+                    raise tok
+                yield tok
         except Exception as e:
-            raise RuntimeError(f"Error streaming LLM response: {e}")
-        finally:
-            # Append the complete assistant reply to history
-            self.history.append({"role": "assistant", "content": full_response})
+            raise RuntimeError(f"LLM streaming error: {e}")
     
     async def summarize_session(self, transcript: str) -> str:
         """

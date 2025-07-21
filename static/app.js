@@ -23,6 +23,15 @@ let micSampleRate = null;
 let playbackEndTime = 0;
 let playbackRate = null;
 let selectedLanguage = 'en-IN'; // default lang
+let selectedCharacter = '';
+
+// Batch streaming performance tracking
+let batchStats = {
+  chunksReceived: 0,
+  totalBytes: 0,
+  lastChunkTime: 0,
+  avgChunkSize: 0,
+};
 
 let authToken = localStorage.getItem('authToken');
 
@@ -38,6 +47,64 @@ window.addEventListener('load', () => {
       console.log(`[UI] Selected language = ${selectedLanguage}`);
     });
   });
+
+  // Character selection
+  const characterSelect = document.getElementById('characterSelect');
+  characterSelect.addEventListener('change', (e) => {
+    selectedCharacter = e.target.value;
+    console.log(`[UI] Selected character = ${selectedCharacter}`);
+  });
+
+  // Fetch and populate character dropdown from database
+  async function loadCharacters() {
+    try {
+      console.log('[UI] Fetching characters from database...');
+      const response = await fetch('/api/characters');
+      const data = await response.json();
+
+      if (data.error) {
+        console.error('[UI] Error fetching characters:', data.error);
+        characterSelect.innerHTML =
+          '<option value="">Error loading characters</option>';
+        return;
+      }
+
+      const characters = data.characters || [];
+      console.log(`[UI] Loaded ${characters.length} characters from database`);
+
+      // Clear existing options
+      characterSelect.innerHTML =
+        '<option value="">Select a character...</option>';
+
+      // Add characters from database
+      characters.forEach((char) => {
+        const option = document.createElement('option');
+        option.value = char.id;
+        option.textContent = `${char.name}${
+          char.hasVoiceId ? ' ✓' : ' (no voice)'
+        }`;
+        option.title = `Voice: ${
+          char.hasVoiceId ? 'Available' : 'Missing'
+        }, Prompt: ${char.hasPrompt ? 'Available' : 'Default'}`;
+        characterSelect.appendChild(option);
+      });
+
+      if (characters.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No characters found in database';
+        option.disabled = true;
+        characterSelect.appendChild(option);
+      }
+    } catch (error) {
+      console.error('[UI] Failed to fetch characters:', error);
+      characterSelect.innerHTML =
+        '<option value="">Failed to load characters</option>';
+    }
+  }
+
+  // Load characters when page loads
+  loadCharacters();
 
   if (!authToken) {
     authToken = prompt('Enter authentication token');
@@ -63,6 +130,12 @@ window.addEventListener('load', () => {
           alert('Authentication token is required to start a conversation.');
           return; // abort start
         }
+      }
+
+      // Ensure character is selected before initiating streaming
+      if (!selectedCharacter) {
+        alert('Please select a character before starting the conversation.');
+        return; // abort start
       }
       // ─── USER CLICKED “START” ───────────────────────────────────────
       streaming = true;
@@ -189,19 +262,31 @@ function floatToInt16(floatBuffer) {
 
 // ─── When we receive an Int16@TTS SAMPLE RATE, TTS chunk, convert, resample, and send ──────────
 function handleBinaryFrame(arrayBuffer) {
-  // 1) Read raw 16-bit PCM @ TTS SAMPLE RATE
-  console.log(
-    '[Client] 🔊 Received TTS chunk, byteLength =',
-    arrayBuffer.byteLength
-  );
+  // Fast path: Early exit for empty chunks
+  if (!arrayBuffer.byteLength) return;
 
+  // Update batch statistics for performance monitoring
+  const now = performance.now();
+  batchStats.chunksReceived++;
+  batchStats.totalBytes += arrayBuffer.byteLength;
+  batchStats.avgChunkSize = batchStats.totalBytes / batchStats.chunksReceived;
+
+  const timeSinceLastChunk = batchStats.lastChunkTime
+    ? now - batchStats.lastChunkTime
+    : 0;
+  batchStats.lastChunkTime = now;
+
+  // 1) Read raw 16-bit PCM @ TTS SAMPLE RATE
   const pcm16 = new Int16Array(arrayBuffer);
   if (!pcm16.length) return;
 
-  // 2) Convert to Float32 @ TTS SAMPLE RATE
+  // 2) Optimized conversion to Float32 @ TTS SAMPLE RATE
+  // Using pre-calculated scale for better performance with batch chunks
   const floatsTTS = new Float32Array(pcm16.length);
+  const scale = 1 / 32768; // Pre-calculate division constant
+
   for (let i = 0; i < pcm16.length; i++) {
-    floatsTTS[i] = pcm16[i] / 32768;
+    floatsTTS[i] = pcm16[i] * scale;
   }
 
   // ─── Resample from TTS SAMPLE RATE → playbackRate, if needed ───────────────────
@@ -212,22 +297,22 @@ function handleBinaryFrame(arrayBuffer) {
     toSend = floatsTTS;
   }
 
-  // 3) Post that (possibly resampled) Float32 chunk to the worklet’s port
+  // 3) Immediate streaming: Post chunk to worklet without delay
   playProcessorNode.port.postMessage(toSend);
 
-  // 4) Recompute playbackEndTime:
-  //    We assume “toSend.length” samples will be drained in real time at playbackRate.
-  const now = audioContext.currentTime;
-  playbackEndTime = now + toSend.length / playbackRate;
+  // 4) Update playback timing for smooth streaming
+  const now_audio = audioContext.currentTime;
+  playbackEndTime = now_audio + toSend.length / playbackRate;
 
-  console.log(
-    '[DEBUG] TTS chunk arrived (orig',
-    pcm16.length,
-    'samples → resampled',
-    toSend.length,
-    'samples). Approx unmute at',
-    playbackEndTime.toFixed(3)
-  );
+  // Enhanced logging for batch performance (every 20 chunks or slow chunks)
+  if (batchStats.chunksReceived % 20 === 0 || timeSinceLastChunk > 100) {
+    console.log(
+      `[TTS-Batch] Chunk #${batchStats.chunksReceived}: ${arrayBuffer.byteLength}b, ` +
+        `avg: ${batchStats.avgChunkSize.toFixed(0)}b, ` +
+        `interval: ${timeSinceLastChunk.toFixed(1)}ms, ` +
+        `total: ${(batchStats.totalBytes / 1024).toFixed(1)}KB`
+    );
+  }
 }
 
 // ─── Build WebSocket and attach handlers ───────────────────────────────────────
@@ -238,7 +323,7 @@ function setupWebSocket() {
     window.location.host
   }/ws?lang=${encodeURIComponent(selectedLanguage)}&token=${encodeURIComponent(
     authToken
-  )}`;
+  )}&character=${encodeURIComponent(selectedCharacter)}`;
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
 
