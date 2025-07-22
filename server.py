@@ -260,12 +260,18 @@ async def websocket_endpoint(ws: WebSocket):
         #     idle_task.cancel()
         #     idle_task = None
         # Delegate to TTSClient for streaming and WebSocket forwarding
-        await tts_client.speak_sentence(
-            sentence=sentence,
-            ws=ws,
-            chosen_lang_el=chosen_lang_el,
-            last_user_end_ts=last_user_end_ts,
-        )
+        import re
+        # Remove bracketed or asterisk-wrapped stage directions to prevent TTS from reading them aloud
+        clean_sentence = re.sub(r"(\[[^\]]*\]|\([^\)]*\)|\*[^\*]*\*)", " ", sentence)
+        clean_sentence = re.sub(r"\s+", " ", clean_sentence).strip()
+
+        if clean_sentence:
+            await tts_client.speak_sentence(
+                sentence=clean_sentence,
+                ws=ws,
+                chosen_lang_el=chosen_lang_el,
+                last_user_end_ts=last_user_end_ts,
+            )
 
     # async def idle_watcher():
     #     try:

@@ -95,6 +95,7 @@ class LLMClient:
             "Remember:\n"
             "• Stay in the moment – sound like a real human on the phone.\n"
             "• Do not ask generic questions like 'how was your day?' – keep it intimate and immediate.\n"
+            "• Do NOT put actions inside brackets like (giggles) or [laughs]; instead, express them naturally with sounds such as 'mmm', 'ahh', soft giggles written as 'hehe', or short onomatopoeia.\n"
         )
 
         # Use character-specific prompt if provided, otherwise rely solely on base prompt
