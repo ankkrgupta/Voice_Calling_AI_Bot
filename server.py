@@ -120,7 +120,6 @@ else:
 
 # After environment setup, add webhook URL envs
 API_BASE_URL = os.getenv("API_BASE_URL")
-# API_BASE_URL = 'https://dev-api.lonelyfans.club'
 SESSION_ENDPOINT = f"{API_BASE_URL}/v1/voice-calls/session"
 WEBHOOK_ENDPOINT = f"{API_BASE_URL}/v1/voice-calls/webhook"
 
