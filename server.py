@@ -78,6 +78,29 @@ async def get_characters():
         traceback.print_exc()
         return {"characters": [], "error": str(e)}
 
+@app.post("/api/voice-calls/terminate")
+async def terminate_voice_call(request_data: dict):
+    """Terminate a voice call session due to insufficient credits"""
+    try:
+        session_id = request_data.get("sessionId")
+        reason = request_data.get("reason", "Insufficient credits")
+        
+        if not session_id:
+            return {"error": "Session ID required"}, 400
+        
+        # In a real implementation, you'd look up the active WebSocket connection
+        # For now, we'll just log the termination request
+        print(f"[TERMINATION] Request to terminate session {session_id}: {reason}")
+        
+        # The actual termination happens in the credit_deduction_task when 
+        # the webhook returns TERMINATE_CALL action
+        
+        return {"success": True, "message": f"Termination request processed for session {session_id}"}
+        
+    except Exception as e:
+        print(f"[TERMINATION] Error: {e}")
+        return {"error": str(e)}, 500
+
 # RAG engine
 rag_engine = RAGEngine(
     openai_api_key=OPENAI_KEY,
@@ -118,20 +141,33 @@ async def websocket_endpoint(ws: WebSocket):
     user_id: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # Pre-payment model: deduct 10 credits upfront for first minute
             resp = await client.post(
                 SESSION_ENDPOINT,
-                json={"sessionId": session_id},
+                json={
+                    "sessionId": session_id,
+                    "prePayment": True,
+                    "creditsToDeduct": 10
+                },
                 headers={"Authorization": f"Bearer {auth_token}"},
             )
-            print(f"[CREDITS TRY] CREDITS_API_BASE_URL: {API_BASE_URL}")
+            print(f"[CREDITS] Pre-payment attempt for session {session_id}")
+            
+            if resp.status_code == 400:
+                # Insufficient credits - cannot start call
+                error_data = resp.json()
+                print(f"[CREDITS] Insufficient credits: {error_data}")
+                await ws.close(code=1008, reason="Insufficient credits to start call")
+                return
+            
             resp.raise_for_status()
             data = resp.json()
             # Attempt to capture user identifier from response if provided
             session_data = data.get("session") or data.get("data") or {}
             user_id = session_data.get("user") or session_data.get("userId")
+            print(f"[CREDITS] Pre-payment successful, 10 credits deducted for first minute")
     except Exception as e:
-        print(f"[CREDITS EXCEPT] CREDITS_API_BASE_URL: {API_BASE_URL}")
-        print(f"[SessionInit] error contacting {SESSION_ENDPOINT}: {e}")
+        print(f"[CREDITS] Error during pre-payment: {e}")
         await ws.close(code=1011, reason="Session init failed")
         return
 
@@ -212,23 +248,46 @@ async def websocket_endpoint(ws: WebSocket):
     # ─── Background task: ping webhook every minute ─────────────────────
     async def credit_deduction_task(stop_event: asyncio.Event):
         async with httpx.AsyncClient(timeout=10.0) as client:
+            minute_count = 1  # First minute already paid for during session init
             while not stop_event.is_set():
-                # Sleep for 60 seconds but wake up early if stop_event is set
+                # Sleep for 60 seconds (or until stop event)
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=60.0)
                 except asyncio.TimeoutError:
-                    pass  # expected after 60 s
+                    pass  # Expected timeout after 60 seconds
                 if stop_event.is_set():
                     break
-                payload = {"minutes": 1, "callId": session_id}
+                
+                minute_count += 1
+                # Pre-payment for upcoming minute (deduct at START of interval)
+                payload = {
+                    "callId": session_id,
+                    "minute": minute_count,
+                    "prePayment": True,
+                    "creditsToDeduct": 10
+                }
                 if user_id:
                     payload["userId"] = user_id
+                
                 try:
                     resp = await client.post(WEBHOOK_ENDPOINT, json=payload)
-                    resp.raise_for_status()
-                    print(f"[Webhook] credit deduction OK – {payload}")
+                    
+                    if resp.status_code == 200:
+                        response_data = resp.json()
+                        if response_data.get("action") == "TERMINATE_CALL":
+                            print(f"[Webhook] Insufficient credits at minute {minute_count} - terminating call")
+                            # Signal main websocket loop to terminate
+                            stop_event.set()
+                            await ws.close(code=1008, reason="Insufficient credits")
+                            break
+                        else:
+                            print(f"[Webhook] Pre-payment successful for minute {minute_count}")
+                    else:
+                        resp.raise_for_status()
+                        print(f"[Webhook] Pre-payment OK for minute {minute_count}")
                 except Exception as e:
-                    print(f"[Webhook] error: {e}")
+                    print(f"[Webhook] Error during minute {minute_count} pre-payment: {e}")
+                    # Continue call on webhook errors (don't terminate for network issues)
 
     stop_event = asyncio.Event()
     webhook_task = asyncio.create_task(credit_deduction_task(stop_event))
@@ -392,11 +451,21 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         while True:
-            msg = await ws.receive()
-            if msg.get("bytes") is not None:
-                stt.feed_audio(msg["bytes"])
-            elif msg.get("type") == "websocket.disconnect":
+            # Check if we need to terminate due to insufficient credits
+            if stop_event.is_set():
+                print(f"[Session] Terminating session {session_id} due to insufficient credits")
                 break
+                
+            try:
+                # Use timeout to periodically check stop_event
+                msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                if msg.get("bytes") is not None:
+                    stt.feed_audio(msg["bytes"])
+                elif msg.get("type") == "websocket.disconnect":
+                    break
+            except asyncio.TimeoutError:
+                # Timeout is expected - continue loop to check stop_event
+                continue
     finally:
         # end of call → generate and persist a session summary
         # stop webhook task
