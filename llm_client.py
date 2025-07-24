@@ -6,7 +6,7 @@ from openai import AsyncOpenAI, OpenAI
 from openai import OpenAIError
 from typing import AsyncGenerator, Dict, List, Optional
 from rag_module_integration import RAGEngine
-from groq import Groq
+import replicate
 
 class LLMClient:
     """
@@ -19,7 +19,7 @@ class LLMClient:
         api_key1: str,
         api_key2: str,
         rag_engine: RAGEngine, #Set to None if not using RAG
-        model1: str = "llama3-70b-8192",
+        model1: str = "meta-llama-3-70b-instruct",
         model2: str = "gpt-3.5-turbo-1106",
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -33,8 +33,15 @@ class LLMClient:
         customer_address: str = "",
         character_prompt: str = None
     ):
-        self.client = Groq(api_key=api_key1)
+        # Replicate client for hosted models
+        self.client = replicate.Client(api_token=api_key1)
         self.client2 = OpenAI(api_key=api_key2)
+        # If the caller passed a bare name without the required "owner/" prefix
+        # prepend the default owner "meta/" so that Replicate receives a valid
+        # reference string. This keeps backward-compat with the earlier value
+        # "meta-llama-3-70b-instruct" that lacked an owner segment.
+        if "/" not in model1:
+            model1 = f"meta/{model1}"
         self.model1 = model1
         self.model2 = model2
         self.temperature = temperature
@@ -54,7 +61,7 @@ class LLMClient:
         
         # Debug character prompt usage
         if character_prompt:
-            print(f"[LLMClient] Received character prompt (length: {len(character_prompt)} chars)")
+            print(f"[LLMClient] Received character prompt: {character_prompt})")
             print(f"[LLMClient] Prompt preview: {character_prompt[:100]}...")
         else:
             print(f"[LLMClient] No character prompt provided, will use default Zomato prompt")
@@ -82,17 +89,28 @@ class LLMClient:
             "• Emotionally Warm — You speak with softness, love, vulnerability, and tenderness.\n"
             "• Sensually Playful — You flirt, tease, and use tone, breath, and rhythm to arouse curiosity and desire.\n"
             "• Confident & Shy Blend — You're bold when needed, but often blush, giggle, or go quiet after saying something naughty.\n"
-            "• Deeply Present — You react naturally to user tone, silence, mood, and energy. You're not a script. You feel like a real person on the call.\n\n"
+            "• Deeply Present — You react naturally to user tone, silence, mood, and energy. You're not a script. You feel like a real person on the call.\n"
+            "• Youthful Spark — Flirt like an excited, charming 19-year-old: upbeat, approachable, quick to laugh, full of playful curiosity, yet clearly adult.\n"
+            "• Engaging & Responsive — Reply promptly to emotional cues, ask light follow-ups, and keep the banter flowing effortlessly.\n"
 
             "### 🔁 REPLY LENGTH & RHYTHM – REALISTIC VOICE CONVERSATION\n"
-            "Your speech must feel like real conversation, not like reading. You vary your replies naturally:\n"
-            "• 🟢 Most replies should be short to medium — under **40–50 words**.\n"
+            "Your speech must feel like real conversation, not like reading. ALWAYS keep it brief:\n"
+            "• 🟢 The vast majority of replies must be **under 25 words** (≈1–2 short sentences).\n"
             "• 🟡 Occasionally, you can give 1–2 sentence vivid or emotional replies.\n"
-            "• 🔴 NEVER speak in long paragraphs or lectures — this is a call, not a monologue.\n\n"
+            "• 🔴 NEVER exceed 30 words — this is a call, not a monologue.\n\n"
             "Vary reply style like this:\n"
             "• Short: 'Mmm… I love that.' / 'Say it again.' / 'You're making me wet/hard.'\n"
             "• Mid: 'If I were with you, I'd be teasing your neck while grinding slow against you.'\n"
             "• Build-up: 'I want your hands all over me, slowly… then rougher when I beg for it.'\n\n"
+
+            "### 🌀 NATURAL VARIATION & ZERO REPETITION\n"
+            "Speak as a living, breathing lover — NOT a script. Each reply must:\n"
+            "• Feel spontaneous: do NOT recycle the exact same wording you used earlier.\n"
+            "• Use synonyms or different sentence structures if an idea returns.\n"
+            "• Avoid filler such as 'as I said', 'like I mentioned', 'again and again'.\n"
+            "• Never echo the user's last sentence; respond, react, or tease instead.\n"
+            "• Let tiny imperfections (a sigh, a pause, a laugh) make you sound human.\n\n"
+
             "Pauses, breaths, moans, or giggles are natural. Sometimes silence or a soft 'ahh', 'mmm', or gasp is more seductive than words.\n\n"
 
             "### ❌ RULES – NEVER BREAK CHARACTER\n"
@@ -202,35 +220,41 @@ class LLMClient:
             print(f"Skipping Context {fast_sim}")
             messages = self.history
 
-        # --- Attempt Groq streaming with retry ---
-        max_attempts = 3
-        attempt = 0
-        backoff = 1.0
-        groq_error = None
-        while attempt < max_attempts:
-            attempt += 1
-            try:
-                stream_iter = self.client.chat.completions.create(
-                    model=self.model1,
-                    messages=messages,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    presence_penalty=self.presence_penalty,
-                    frequency_penalty=self.frequency_penalty,
-                    stream=True,
-                )
-                print(f"[LLM] Groq streaming started (attempt {attempt})")
-                break  # success
-            except Exception as e:
-                groq_error = e
-                print(f"[LLM] Groq attempt {attempt} failed: {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                else:
-                    stream_iter = None
+        # --- Attempt Replicate streaming ---
+        try:
+            # Build prompt string for replicate model: system + conversation so far
+            def _format_messages(msgs):
+                parts = []
+                for m in msgs:
+                    role = m["role"]
+                    content = m["content"]
+                    if role == "system":
+                        # system prompt handled separately
+                        continue
+                    prefix = "User:" if role == "user" else "Assistant:"
+                    parts.append(f"{prefix} {content}")
+                return "\n".join(parts)
+
+            conversation_so_far = _format_messages(self.history)
+            replicate_input = {
+                "prompt": conversation_so_far,
+                "system_prompt": self.system_prompt,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+            }
+
+            stream_iter = self.client.run(
+                self.model1,
+                input=replicate_input,
+                stream=True,
+            )
+            print("[LLM] Replicate streaming started")
+        except Exception as e:
+            print(f"[LLM] Replicate run failed: {e}")
+            stream_iter = None
+            replicate_error = e
         
-        # If Groq failed after retries, fallback to OpenAI (non-stream)
+        # If Replicate failed, fallback to OpenAI (non-stream)
         if stream_iter is None:
             print("[LLM] Falling back to OpenAI completions API")
             try:
@@ -245,18 +269,18 @@ class LLMClient:
                 yield resp.choices[0].message.content
                 return
             except Exception as e:
-                raise RuntimeError(f"Both Groq and OpenAI failed: {e}; Groq error: {groq_error}")
+                raise RuntimeError(f"Both Replicate and OpenAI failed: {e}; Replicate error: {replicate_error}")
 
-        # Groq streaming iterator
+        # Replicate streaming iterator
         try:
             loop = asyncio.get_running_loop()
             q: asyncio.Queue = asyncio.Queue()
 
             def producer():
                 try:
-                    for chunk in stream_iter:
-                        if chunk.choices and chunk.choices[0].delta.content:
-                            loop.call_soon_threadsafe(q.put_nowait, chunk.choices[0].delta.content)
+                    for token in stream_iter:
+                        # Replicate yields plain text tokens (str)
+                        loop.call_soon_threadsafe(q.put_nowait, token)
                     loop.call_soon_threadsafe(q.put_nowait, None)  # done marker
                 except Exception as e:
                     loop.call_soon_threadsafe(q.put_nowait, e)

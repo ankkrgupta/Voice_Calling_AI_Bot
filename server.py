@@ -26,7 +26,7 @@ import httpx
 load_dotenv()
 DG_KEY = os.getenv("DEEPGRAM_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-GROQ_KEY = os.getenv("GROQ_API_KEY")
+REPLICATE_KEY = os.getenv("REPLICATE_API_KEY")
 ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY")
 DEFAULT_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 PDF_PATH = os.getenv("ZOMATO_PDF_PATH", "Zomato_Annual_Report_2023-24.pdf")
@@ -236,21 +236,26 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[MongoDB] Falling back to default voice ID: {voice_id}")
     
     if not character_prompt:
-        print(f"[MongoDB] No custom prompt found, will use default Zomato prompt")
+        print(f"[MongoDB] No custom prompt found")
 
     # Final sanity check
     if not voice_id:
-        print("[Server] CRITICAL: No voice ID available after all fallbacks. Closing connection.")
         await ws.close(code=1011, reason="No voice ID available")
         return
 
     print(f"[Server] Final configuration - Character: {character_name}, Voice ID: {voice_id}, Custom Prompt: {character_prompt is not None}")
 
-    print(f"[Server] Starting STT with language = {chosen_language}")
+
     chosen_lang_el = "en" if chosen_language=="en-IN" else "hi"
     user_phone = "6306061252"
-    llm = LLMClient(GROQ_KEY, OPENAI_KEY, rag_engine, customer_phone=user_phone, 
-                    assistant_name=character_name, character_prompt=character_prompt)
+    llm = LLMClient(
+        REPLICATE_KEY,
+        OPENAI_KEY,
+        rag_engine,
+        customer_phone=user_phone,
+        assistant_name=character_name,
+        character_prompt=character_prompt,
+    )
     
     # Initialize TTS client with improved mobile streaming settings
     tts_client = TTSClient(
