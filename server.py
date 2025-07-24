@@ -137,6 +137,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     # ─── Create unique session id and notify credits API ────────────────
     session_id = str(uuid.uuid4())
+    # Track how many credits have been deducted during the lifetime of this session
+    total_credits_deducted: int = 0
     user_id: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -165,6 +167,18 @@ async def websocket_endpoint(ws: WebSocket):
             session_data = data.get("session") or data.get("data") or {}
             user_id = session_data.get("user") or session_data.get("userId")
             print(f"[CREDITS] Pre-payment successful, 10 credits deducted for first minute")
+            # First minute has been prepaid – update running total
+            total_credits_deducted = 10
+            print(f"[CREDITS] Running total after first minute: {total_credits_deducted}")
+            # Inform client immediately about the initial deduction
+            try:
+                await ws.send_json({
+                    "type": "credits_info",
+                    "totalCreditDeducted": total_credits_deducted,
+                })
+                print("[CREDITS] Sent initial credits_info to client")
+            except Exception as e:
+                print(f"[CREDITS] Failed to send initial credits_info: {e}")
     except Exception as e:
         print(f"[CREDITS] Error during pre-payment: {e}")
         await ws.close(code=1011, reason="Session init failed")
@@ -238,14 +252,22 @@ async def websocket_endpoint(ws: WebSocket):
     llm = LLMClient(GROQ_KEY, OPENAI_KEY, rag_engine, customer_phone=user_phone, 
                     assistant_name=character_name, character_prompt=character_prompt)
     
-    # Initialize TTS client with character's voice ID
-    tts_client = TTSClient(api_key=ELEVEN_KEY, voice_id=voice_id)
+    # Initialize TTS client with improved mobile streaming settings
+    tts_client = TTSClient(
+        api_key=ELEVEN_KEY,
+        voice_id=voice_id,
+        sample_rate=24000,   # lighter than 44.1 kHz → lower bandwidth
+        batch_size_ms=100,   # flush every 100 ms
+        chunk_size_ms=100,   # slices sent to client ≈ 100 ms each
+    )
     
     # Reset buffer for clean session state
     tts_client.reset_buffer()
 
     # ─── Background task: ping webhook every minute ─────────────────────
     async def credit_deduction_task(stop_event: asyncio.Event):
+        # Access the outer-scope counter so we can update it from here
+        nonlocal total_credits_deducted
         async with httpx.AsyncClient(timeout=10.0) as client:
             minute_count = 1  # First minute already paid for during session init
             while not stop_event.is_set():
@@ -277,13 +299,41 @@ async def websocket_endpoint(ws: WebSocket):
                             print(f"[Webhook] Insufficient credits at minute {minute_count} - terminating call")
                             # Signal main websocket loop to terminate
                             stop_event.set()
+                            # Inform client about the credits spent so far BEFORE closing
+                            try:
+                                await ws.send_json({
+                                    "type": "credits_info",
+                                    "totalCreditDeducted": total_credits_deducted,
+                                })
+                            except Exception:
+                                pass  # Socket might already be closing
                             await ws.close(code=1008, reason="Insufficient credits")
                             break
                         else:
                             print(f"[Webhook] Pre-payment successful for minute {minute_count}")
+                            # Add credits for this successfully-paid minute
+                            total_credits_deducted += 10
+                            print(f"[CREDITS] Running total after minute {minute_count}: {total_credits_deducted}")
+                            # Notify client of updated total
+                            try:
+                                await ws.send_json({
+                                    "type": "credits_info",
+                                    "totalCreditDeducted": total_credits_deducted,
+                                })
+                            except Exception:
+                                pass
                     else:
                         resp.raise_for_status()
                         print(f"[Webhook] Pre-payment OK for minute {minute_count}")
+                        total_credits_deducted += 10
+                        print(f"[CREDITS] Running total after minute {minute_count}: {total_credits_deducted}")
+                        try:
+                            await ws.send_json({
+                                "type": "credits_info",
+                                "totalCreditDeducted": total_credits_deducted,
+                            })
+                        except Exception:
+                            pass
                 except Exception as e:
                     print(f"[Webhook] Error during minute {minute_count} pre-payment: {e}")
                     # Continue call on webhook errors (don't terminate for network issues)
@@ -484,6 +534,16 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"[MEMORY] summary error: {e}")
         # teardown
         stt.finish()
+        # Always try to send a final credit summary before closing the socket
+        try:
+            await ws.send_json({
+                "type": "credits_info",
+                "totalCreditDeducted": total_credits_deducted,
+            })
+        except Exception:
+            pass
+
+        print(f"[CREDITS] Final total credits deducted for session {session_id}: {total_credits_deducted}")
         try:
             await ws.close()
         except RuntimeError:
