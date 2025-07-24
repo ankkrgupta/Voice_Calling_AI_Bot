@@ -22,21 +22,47 @@ class TTSClient:
         self,
         api_key: str,
         voice_id: str,
-        optimize_latency: int = 3
+        optimize_latency: int = 3,
+        *,
+        sample_rate: int = 24000,
+        batch_size_ms: int = 100,
+        chunk_size_ms: int = 100,
     ):
+        """Create a TTS client suitable for real-time mobile voice calls.
+
+        Parameters
+        ----------
+        api_key, voice_id : str
+            ElevenLabs credentials.
+        optimize_latency : int, default 3
+            ElevenLabs latency preset (0-4). Lower = lower latency but potentially more jitter.
+        sample_rate : int, default 24000
+            PCM sample-rate to request from ElevenLabs (reduces bandwidth vs 44.1 kHz).
+        batch_size_ms : int, default 100
+            Accumulate *this* many milliseconds of audio before flushing.
+        chunk_size_ms : int, default 100
+            Size of the slices actually sent over the socket (<= batch size).
+        """
+
         self.client = ElevenLabs(api_key=api_key)
         self.voice_id = voice_id
         self.optimize_latency = optimize_latency
-        
-        # Advanced streaming optimizations
-        self.audio_buffer = deque()  # Persistent buffer queue
-        self.batch_size_ms = 250  # Target 250ms batches for optimal performance
-        self.optimal_chunk_size = 13230  # ~150ms at 44.1kHz 16-bit mono
-        self.batch_size_bytes = int(44100 * 2 * (self.batch_size_ms / 1000))  # ~22,050 bytes
-        
-        # Latency monitoring for adaptive throttling
-        self.latency_window = deque(maxlen=10)  # Rolling window of last 10 measurements
-        self.last_send_time = 0
+
+        # Stream configuration
+        self.sample_rate = sample_rate
+        self.batch_size_ms = batch_size_ms
+        self.chunk_size_ms = chunk_size_ms
+
+        bytes_per_sample = 2  # 16-bit mono
+
+        # Derived sizes
+        self.batch_size_bytes = int(self.sample_rate * bytes_per_sample * (self.batch_size_ms / 1000))
+        self.optimal_chunk_size = int(self.sample_rate * bytes_per_sample * (self.chunk_size_ms / 1000))
+
+        # Internal buffers/metrics
+        self.audio_buffer = deque()
+        self.latency_window = deque(maxlen=10)
+        self.last_send_time = 0.0
         self.total_bytes_sent = 0
         
     def _calculate_adaptive_delay(self) -> float:
@@ -118,7 +144,7 @@ class TTSClient:
                     model_id="eleven_flash_v2_5",
                     optimize_streaming_latency=self.optimize_latency,
                     language_code=chosen_lang_el,
-                    output_format="pcm_44100",
+                    output_format="pcm_24000" if self.sample_rate == 24000 else "pcm_44100",
                 )
                 break
             except Exception as e:
@@ -158,5 +184,8 @@ class TTSClient:
 
         if t0:
             total = time.perf_counter() - t0
-            avg_latency = sum(self.latency_window) / len(self.latency_window) if self.latency_window else 0
-            print(f"[TIMING] TTS sentence: {total:.3f}s, chunks: {chunk_count}, avg_send_latency: {avg_latency*1000:.1f}ms")
+            avg_latency = sum(self.latency_window) / len(self.latency_window) if self.latency_window else 0.0
+            print(
+                f"[TIMING] TTS sentence: {total:.3f}s, chunks: {chunk_count}, "
+                f"avg_send_latency: {avg_latency*1000:.1f}ms"
+            )
