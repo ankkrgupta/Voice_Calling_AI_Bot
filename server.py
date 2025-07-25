@@ -364,18 +364,48 @@ async def websocket_endpoint(ws: WebSocket):
         # print("idle_task done")
 
     async def speak_sentence(sentence: str):
+        # Check if WebSocket is still open before proceeding
+        if ws.client_state.name != "CONNECTED":
+            return
         # Helper: speak a sentence chunk using TTSClient
         # nonlocal idle_task
-        if not tts_client:
-            return
         # Cancel any existing idle watcher
         # if idle_task:
         #     idle_task.cancel()
         #     idle_task = None
         # Delegate to TTSClient for streaming and WebSocket forwarding
         import re
-        # Remove bracketed or asterisk-wrapped stage directions to prevent TTS from reading them aloud
-        clean_sentence = re.sub(r"(\[[^\]]*\]|\([^\)]*\)|\*[^\*]*\*)", " ", sentence)
+        # Remove bracketed/asterisk stage directions AND action words that shouldn't be spoken
+        # First remove bracketed content and asterisk stage directions (including multi-line)
+        clean_sentence = re.sub(r"(\[[^\]]*\]|\([^\)]*\))", " ", sentence)
+        # Remove asterisk content more aggressively (handles incomplete asterisks)
+        clean_sentence = re.sub(r'\*[^*]*\*?', ' ', clean_sentence)
+        # Remove any remaining asterisks
+        clean_sentence = re.sub(r'\*+', ' ', clean_sentence)
+        
+        # Remove emotional descriptors and action words aggressively
+        action_patterns = [
+            # Action words
+            r'\bgiggle[sd]?\b', r'\blaugh[sed]?\b', r'\bchuckle[sd]?\b', 
+            r'\bsigh[sed]?\b', r'\bmoan[sed]?\b', r'\bwhisper[sed]?\b',
+            r'\bbreathe[sd]?\b', r'\bpant[sed]?\b', r'\bgasp[sed]?\b',
+            r'\bstutter[sed]?\b', r'\bstammer[sed]?\b', r'\bblush[ed]?\b',
+            r'\bsmile[sd]?\b', r'\bgrin[ned]?\b', r'\bwink[sed]?\b',
+            # Descriptive words
+            r'\bsoft[ly]?\b', r'\bbreathy?\b', r'\bbreathily\b',
+            r'\bseductively?\b', r'\bplayfully?\b', r'\bteasingly?\b',
+            r'\bwhispering\b', r'\bbreathing\b', r'\bpanting\b',
+            r'\bgreeting\b', r'\bgentle\b', r'\bgently\b',
+            r'\bpauses?\b', r'\bpause[sd]?\b',
+            # Phrases
+            r'\bin a .* voice\b', r'\bwith a .* tone\b',
+            r'\bsays?\b', r'\bsaid\b', r'\bsaying\b'
+        ]
+        
+        for pattern in action_patterns:
+            clean_sentence = re.sub(pattern, "", clean_sentence, flags=re.IGNORECASE)
+         
+        # Remove multiple spaces and clean up
         clean_sentence = re.sub(r"\s+", " ", clean_sentence).strip()
 
         if clean_sentence:
@@ -402,10 +432,14 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[{t_llm_start:.3f}] → sending to LLM (text='{text[:30]}...')")
 
         response_buffer = ""
+        first_chunk_sent = False
         first_token_logged = False
         last_token_ts = None
         try:
             async for token in llm.stream_response(text):
+                # Check if WebSocket is still open before sending tokens
+                if ws.client_state.name != "CONNECTED":
+                    break
                 now = time.perf_counter()
                 if not first_token_logged and token:
                     print(f"[{now:.3f}] ← first LLM token")
@@ -414,6 +448,15 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "token", "token": token})
 
                 response_buffer += token
+                # Early flush: send initial chunk once we have ~10 words
+                if not first_chunk_sent and len(response_buffer.split()) >= 10:
+                    early_sentence = response_buffer.strip()
+                    response_buffer = ""
+                    first_chunk_sent = True
+                    task = asyncio.create_task(speak_sentence(early_sentence))
+                    current_speech_tasks.add(task)
+                    task.add_done_callback(lambda fut: current_speech_tasks.discard(fut))
+
                 # flush each complete sentence immediately
                 while True:
                     m = re.search(r"([\.\!,?|])(\s|$)", response_buffer)
@@ -439,7 +482,8 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[{time.perf_counter():.3f}] [Buffer] final flush: '{final_sent}'")
                 speak_task = asyncio.create_task(speak_sentence(final_sent))
                 # speak_task.add_done_callback(lambda fut: schedule_idle())
-            await ws.send_json({"type": "response_end"})
+            if ws.client_state.name == "CONNECTED":
+                await ws.send_json({"type": "response_end"})
         finally:
             t_llm_end = time.perf_counter()
             print(f"[TIMING] LLM inference took {t_llm_end - t_llm_start:.3f} sec")
@@ -452,17 +496,19 @@ async def websocket_endpoint(ws: WebSocket):
         #     idle_task.cancel()
         #     idle_task = None
         spec_launched=False
-        await ws.send_json({"type": "transcript", "text": text, "final": is_final})
+        # Check WebSocket state before sending transcript updates
+        if ws.client_state.name == "CONNECTED":
+            await ws.send_json({"type": "transcript", "text": text, "final": is_final})
         # record for end‑of‑call summary
         transcripts.append(text)
         now = time.perf_counter()
 
         if not is_final:
             # If the interim has >2 words, we stop speaking and start a confirmation timer
-            if len(text.split()) >= 1 and not spec_launched:
-                # Cancel any in‑flight speech
-                await ws.send_json({"type": "stop_speech"})
-                spec_launched=True
+            if len(text.split()) >= 1:
+                # Early interruption: stop current TTS but DO NOT mark LLM launched
+                if ws.client_state.name == "CONNECTED":
+                    await ws.send_json({"type": "stop_speech"})
             if len(text.split()) >= 3:
                 if text == last_interim and (now - last_interim_ts) >= 0.15 and not spec_launched:
                     spec_launched = True
@@ -472,7 +518,8 @@ async def websocket_endpoint(ws: WebSocket):
                     current_speech_tasks.clear()
                     last_user_end_ts = now
                     print(f"[{now:.3f}] [STT] stable interim: '{text}'")
-                    await ws.send_json({"type": "stop_speech"})
+                    if ws.client_state.name == "CONNECTED":
+                        await ws.send_json({"type": "stop_speech"})
                     # asyncio.create_task(launch_llm(text))
                     current_tts_task = asyncio.create_task(launch_llm(text))
                 elif text != last_interim:
@@ -481,19 +528,16 @@ async def websocket_endpoint(ws: WebSocket):
             return
         last_user_end_ts = now
 
-        if not spec_launched:
-            spec_launched = True
-            for t in list(current_speech_tasks):
-                if not t.done():
-                    t.cancel()
-            current_speech_tasks.clear()
-            print(f"[{now:.3f}] [STT] final transcript kickoff: '{text}'")
+        # Always process final transcripts regardless of spec_launched state
+        for t in list(current_speech_tasks):
+            if not t.done():
+                t.cancel()
+        current_speech_tasks.clear()
+        print(f"[{now:.3f}] [STT] final transcript kickoff: '{text}'")
+        if ws.client_state.name == "CONNECTED":
             await ws.send_json({"type": "stop_speech"})
-            current_tts_task = asyncio.create_task(launch_llm(text))
-        
-        if spec_launched:
-            spec_launched = False
-            return
+        spec_launched = True
+        current_tts_task = asyncio.create_task(launch_llm(text))
 
     # Start STT
     stt = DeepgramTranscriber(DG_KEY, use_mic=False, language=chosen_language)
