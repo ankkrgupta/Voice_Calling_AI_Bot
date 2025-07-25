@@ -97,7 +97,9 @@ class TTSClient:
                 
                 # Send with latency tracking
                 send_start = time.perf_counter()
-                await ws.send_bytes(chunk)
+                # Check WebSocket state before sending audio data
+                if ws.client_state.name == "CONNECTED":
+                    await ws.send_bytes(chunk)
                 send_duration = time.perf_counter() - send_start
                 
                 # Track latency for adaptive throttling
