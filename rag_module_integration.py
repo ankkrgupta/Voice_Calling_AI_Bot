@@ -5,7 +5,6 @@ import numpy as np
 from datetime import datetime
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
 from sentence_transformers import SentenceTransformer
 
 class RAGEngine:
@@ -25,28 +24,22 @@ class RAGEngine:
         index_path: str = "zomato_hnsw_index",
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
-        embedding_model: str = "text-embedding-ada-002",
+        embedding_model: str = "all-MiniLM-L6-v2",
         ef_construction: int = 200,
         M: int = 16,
         fast_threshold: float = 0.60,
     ):
-        self.openai_api_key = openai_api_key
         self.pdf_path = pdf_path
         self.index_dir = index_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        os.environ["OPENAI_API_KEY"] = openai_api_key
-
-        # Fast pre-filter: MiniLM embedder + HNSW
+        # Fast pre-filter: MiniLM embedder + HNSW (local, no OpenAI)
         self.fast_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        # Full RAG embedder (local SentenceTransformer as well)
+        self.full_embedder = SentenceTransformer(embedding_model)
         self.fast_threshold = fast_threshold
         self.fast_index: hnswlib.Index = None
         self.fast_dim: int = None
-
-        # Full RAG: OpenAI embeddings + full-dim HNSW
-        self.embeddings = OpenAIEmbeddings(
-            model=embedding_model, openai_api_key=openai_api_key
-        )
         self.ef_construction = ef_construction
         self.M = M
         self.index: hnswlib.Index = None
@@ -84,11 +77,9 @@ class RAGEngine:
         chunks = splitter.split_documents(docs)
         texts = [c.page_content for c in chunks]
 
-        # 2) Full-embeds
-        all_full = []
-        for i in range(0, len(texts), 32):
-            all_full.extend(self.embeddings.embed_documents(texts[i:i+32]))
-        full_np = np.array(all_full, dtype="float32")
+        # 2) Full-embeds (local)
+        full_np = self.full_embedder.encode(texts, convert_to_numpy=True)
+        full_np = full_np.astype("float32")
         self.dim = full_np.shape[1]
 
         # 3) Build full HNSW
@@ -141,14 +132,12 @@ class RAGEngine:
         if self._fast_relevance(query) < self.fast_threshold:
             return ""
         # full retrieval
-        full_vec = self.embeddings.embed_query(query)
-        q_np = np.array(full_vec, dtype="float32").reshape(1, -1)
+        q_np = self.full_embedder.encode([query], convert_to_numpy=True).astype("float32")
         labels, _ = self.index.knn_query(q_np, k=k)
         return "\n---\n".join(self.id2text[i] for i in labels[0] if i < len(self.id2text))
 
     def build_memory_index(self, summaries: list[str]):
-        embeds = self.embeddings.embed_documents(summaries)
-        arr = np.array(embeds, dtype="float32")
+        arr = self.full_embedder.encode(summaries, convert_to_numpy=True).astype("float32")
         dim = arr.shape[1]
         self.mem_index = hnswlib.Index(space="cosine", dim=dim)
         self.mem_index.init_index(max_elements=max(50+len(summaries),50*len(summaries)), ef_construction=self.ef_construction, M=self.M)

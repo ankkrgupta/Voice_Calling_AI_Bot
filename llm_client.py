@@ -1,55 +1,43 @@
 import asyncio
-import numpy as np
 import time
-import openai
-from openai import AsyncOpenAI, OpenAI
-from openai import OpenAIError
 from typing import AsyncGenerator, Dict, List, Optional
 from rag_module_integration import RAGEngine
-import replicate
+import httpx
+import json
 
 class LLMClient:
     """
-    Wrapper around OpenAI Chat API that streams tokens for a conversational agent.
-    Maintains chat history and yields partial responses.
+    Wrapper around Replicate Predictions API for conversational responses.
+    Maintains chat history and yields response chunks (non-streaming from API, chunked locally).
     """
 
     def __init__(
         self,
-        api_key1: str,
-        api_key2: str,
-        rag_engine: RAGEngine, #Set to None if not using RAG
-        model1: str = "meta/meta-llama-3-8b-instruct",
-        model2: str = "gpt-3.5-turbo-1106",
+        replicate_api_token: str,
+        rag_engine: RAGEngine,  # Set to None if not using RAG
+        model1: str = "deepseek-ai/deepseek-v3.1",
         temperature: float = 0.3,  # lower randomness for speed
         top_p: float = 0.8,
         presence_penalty: float = 0.7,
-        frequency_penalty: float = 0.9,  # much higher to prevent repetition
+        frequency_penalty: float = 0.9,  # retained for compatibility (not used by Replicate)
         assistant_name: str = "Meera",
         call_direction: str = "Outgoing",
         customer_name: str = "",
         customer_email: str = "",
         customer_phone: str = "6306061251",
         customer_address: str = "",
-        character_prompt: str = None
+        character_prompt: str = None,
     ):
-        # Replicate client for hosted models
-        self.client = replicate.Client(api_token=api_key1)
-        self.client2 = OpenAI(api_key=api_key2)
-        # If the caller passed a bare name without the required "owner/" prefix
-        # prepend the default owner "meta/" so that Replicate receives a valid
-        # reference string. This keeps backward-compat with the earlier value
-        # "meta-llama-3-70b-instruct" that lacked an owner segment.
-        if "/" not in model1:
-            model1 = f"meta/{model1}"
+        # Replicate configuration
+        self.replicate_api_token = replicate_api_token
+        # Expect fully-qualified model identifier "owner/name"
         self.model1 = model1
-        self.model2 = model2
         self.temperature = temperature
         self.top_p = top_p
         self.presence_penalty = presence_penalty
         self.frequency_penalty = frequency_penalty
         self.history: List[Dict[str, str]] = []
-        self.rag = rag_engine  #Uncomment if using RAG
+        self.rag = rag_engine  # Un-comment/assign if using RAG
         # Metadata for constructing system prompt
         self.assistant_name = assistant_name
         self.call_direction = call_direction
@@ -199,13 +187,13 @@ class LLMClient:
 
     async def stream_response(self, user_text: str) -> AsyncGenerator[str, None]:
         """
-        Sends the user's message to the model, streams partial tokens, and returns them.
-        Includes retry logic & fallback to OpenAI if Groq is unavailable.
+        Sends the user's message to the model via Replicate Predictions API.
+        Since the Replicate call is non-streaming, we poll for status and then
+        yield the final text in locally chunked segments to preserve downstream behavior.
         """
         self.history.append({"role": "user", "content": user_text})
         # trim context to speed up completion
         self._trim_history()
-        full_response = ""
 
         rag_rel_start = time.perf_counter()
         fast_sim = self.rag._fast_relevance(user_text) if self.rag else 0
@@ -227,16 +215,13 @@ class LLMClient:
             print(f"Skipping Context {fast_sim}")
             messages = self.history
 
-        # --- Attempt Replicate streaming ---
-        try:
-            # Build prompt string for replicate model: system + conversation so far
+        # Build a single prompt string from history (excluding system)
             def _format_messages(msgs):
                 parts = []
                 for m in msgs:
                     role = m["role"]
                     content = m["content"]
                     if role == "system":
-                        # system prompt handled separately
                         continue
                     prefix = "User:" if role == "user" else "Assistant:"
                     parts.append(f"{prefix} {content}")
@@ -250,60 +235,82 @@ class LLMClient:
                 "top_p": self.top_p,
             }
 
-            stream_iter = self.client.run(
-                self.model1,
-                input=replicate_input,
-                stream=True,
-            )
-            print("[LLM] Replicate streaming started")
-        except Exception as e:
-            print(f"[LLM] Replicate run failed: {e}")
-            stream_iter = None
-            replicate_error = e
-        
-        # If Replicate failed, fallback to OpenAI (non-stream)
-        if stream_iter is None:
-            print("[LLM] Falling back to OpenAI completions API")
+        headers = {
+            "Authorization": f"Token {self.replicate_api_token}",
+            "Content-Type": "application/json",
+        }
+
+        # Create prediction
+        create_url = f"https://api.replicate.com/v1/models/{self.model1}/predictions"
+        prediction_id: Optional[str] = None
+        async with httpx.AsyncClient() as client:
             try:
-                resp = self.client2.chat.completions.create(
-                    model=self.model2,
-                    messages=messages,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    presence_penalty=self.presence_penalty,
-                    frequency_penalty=self.frequency_penalty,
+                create_resp = await client.post(
+                    create_url,
+                    headers=headers,
+                    json={
+                        "stream": False,
+                        "input": replicate_input,
+                    },
+                    timeout=45.0,
                 )
-                yield resp.choices[0].message.content
-                return
+                create_resp.raise_for_status()
+                create_json = create_resp.json()
+                prediction_id = create_json.get("id")
+                if not prediction_id:
+                    raise RuntimeError("No prediction id returned from Replicate")
             except Exception as e:
-                raise RuntimeError(f"Both Replicate and OpenAI failed: {e}; Replicate error: {replicate_error}")
+                raise RuntimeError(f"Replicate prediction creation failed: {e}")
 
-        # Replicate streaming iterator
-        try:
-            loop = asyncio.get_running_loop()
-            q: asyncio.Queue = asyncio.Queue()
-
-            def producer():
-                try:
-                    for token in stream_iter:
-                        # Replicate yields plain text tokens (str)
-                        loop.call_soon_threadsafe(q.put_nowait, token)
-                    loop.call_soon_threadsafe(q.put_nowait, None)  # done marker
-                except Exception as e:
-                    loop.call_soon_threadsafe(q.put_nowait, e)
-
-            import threading
-            threading.Thread(target=producer, daemon=True).start()
-
+            # Poll status
+            status_url = f"https://api.replicate.com/v1/predictions/{prediction_id}"
+            start_ts = time.perf_counter()
+            text_output: str = ""
             while True:
-                tok = await q.get()
-                if tok is None:
-                    break
-                if isinstance(tok, Exception):
-                    raise tok
-                yield tok
-        except Exception as e:
-            raise RuntimeError(f"LLM streaming error: {e}")
+                try:
+                    status_resp = await client.get(
+                        status_url,
+                        headers=headers,
+                        timeout=15.0,
+                    )
+                    status_resp.raise_for_status()
+                    status_json = status_resp.json()
+                    status = status_json.get("status")
+                    if status in ("succeeded", "failed", "canceled"):
+                        if status == "succeeded":
+                            output = status_json.get("output")
+                            if isinstance(output, list):
+                                text_output = "".join(str(x) for x in output)
+                            elif isinstance(output, str):
+                                text_output = output
+                            else:
+                                text_output = json.dumps(output) if output is not None else ""
+                        else:
+                            err = status_json.get("error") or status_json
+                            raise RuntimeError(f"Replicate prediction {status}: {err}")
+                        break
+                except Exception as e:
+                    raise RuntimeError(f"Replicate prediction status check failed: {e}")
+
+                # simple polling backoff
+                await asyncio.sleep(0.75)
+                if time.perf_counter() - start_ts > 60.0:
+                    raise TimeoutError("Replicate prediction timed out")
+
+        # Yield the final text in chunks separated by sentence boundaries
+        if text_output:
+            buffer = text_output.strip()
+            # Yield in ~sentence chunks to interop with downstream TTS behavior
+            sent = ""
+            for ch in buffer:
+                sent += ch
+                if ch in ".!?|" and len(sent.strip()) > 0:
+                    yield sent
+                    sent = ""
+            if sent.strip():
+                yield sent
+        else:
+            yield ""
     
     async def summarize_session(self, transcript: str) -> str:
         """
@@ -318,20 +325,56 @@ class LLMClient:
             f"{transcript}\n\nRomantic Call Summary:\n"
         )
         print("Transcript\n", transcript)
-        def _sync_summary():
-            # synchronous call to create() wrapped for use in an executor
-            resp = self.client2.chat.completions.create(
-                model=self.model2,
-                messages=[{"role": "system", "content": prompt}],
-                temperature=0.0,
-            )
-            return resp.choices[0].message.content.strip()
+        headers = {
+            "Authorization": f"Token {self.replicate_api_token}",
+            "Content-Type": "application/json",
+        }
+        create_url = f"https://api.replicate.com/v1/models/{self.model1}/predictions"
+        input_payload = {
+            "prompt": prompt,
+            "system_prompt": self.system_prompt,
+            "temperature": 0.0,
+            "top_p": self.top_p,
+        }
+        async with httpx.AsyncClient() as client:
+            try:
+                create_resp = await client.post(
+                    create_url,
+                    headers=headers,
+                    json={"stream": False, "input": input_payload},
+                    timeout=45.0,
+                )
+                create_resp.raise_for_status()
+                pred_id = create_resp.json().get("id")
+                if not pred_id:
+                    raise RuntimeError("No prediction id for summary")
+            except Exception as e:
+                print(f"[SUMMARY] create error: {e}")
+                return ""
 
-        try:
-            loop = asyncio.get_running_loop()
-            summary = await loop.run_in_executor(None, _sync_summary)
-            return summary
-            
-        except Exception as e:
-            print(f"[SUMMARY] error: {e}")
-            return ""
+            status_url = f"https://api.replicate.com/v1/predictions/{pred_id}"
+            start_ts = time.perf_counter()
+            while True:
+                try:
+                    status_resp = await client.get(status_url, headers=headers, timeout=15.0)
+                    status_resp.raise_for_status()
+                    data = status_resp.json()
+                    st = data.get("status")
+                    if st in ("succeeded", "failed", "canceled"):
+                        if st == "succeeded":
+                            out = data.get("output")
+                            if isinstance(out, list):
+                                return "".join(str(x) for x in out).strip()
+                            if isinstance(out, str):
+                                return out.strip()
+                            return (json.dumps(out) if out is not None else "").strip()
+                        else:
+                            print(f"[SUMMARY] prediction {st}: {data.get('error') or data}")
+                            return ""
+                except Exception as e:
+                    print(f"[SUMMARY] status error: {e}")
+                    return ""
+                await asyncio.sleep(0.75)
+                if time.perf_counter() - start_ts > 60.0:
+                    print("[SUMMARY] timeout")
+                    return ""

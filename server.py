@@ -250,7 +250,6 @@ async def websocket_endpoint(ws: WebSocket):
     user_phone = "6306061252"
     llm = LLMClient(
         REPLICATE_KEY,
-        OPENAI_KEY,
         rag_engine,
         customer_phone=user_phone,
         assistant_name=character_name,
