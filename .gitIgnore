@@ -1,0 +1,48 @@
+# Environment variables
+.env
+*.env
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Specific compiled files (Deepgram, LLM clients, etc.)
+*_client.cpython-*.pyc
+deepgram_stt.cpython-*.pyc
+server.cpython-*.pyc
+tts_client.cpython-*.pyc
+mongodb_utils.cpython-*.pyc
+rag_module_integration.cpython-*.pyc
+
+# Vector DB / Index Folders
+zomato_hnsw_index/
+
+# Logs
+logs/
+*.log
+
+# Static build folders (if you don't want them)
+static/
+
+# IDE-specific
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Cache
+.cache/
